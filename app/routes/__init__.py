@@ -1,7 +1,7 @@
-from flask import Flask
-from app.routes.auth import auth_bp
+from fastapi import FastAPI
+from app.routes.auth import auth_router
 
 
-def register_blueprints(app: Flask) -> None:
-    """Register all route blueprints with the Flask app."""
-    app.register_blueprint(auth_bp, url_prefix='/api')
+def register_routers(app: FastAPI) -> None:
+    """Include all route routers with the FastAPI app."""
+    app.include_router(auth_router, prefix='/api')

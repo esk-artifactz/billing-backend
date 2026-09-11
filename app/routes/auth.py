@@ -1,11 +1,55 @@
 from datetime import datetime
-from flask import Blueprint, request, jsonify
-from werkzeug.security import generate_password_hash, check_password_hash
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from werkzeug.security import check_password_hash as werkzeug_check, generate_password_hash as werkzeug_hash
+
 from app.db import get_connection, release_connection, get_cursor
 
-auth_bp = Blueprint('auth', __name__)
+auth_router = APIRouter()
 
 VALID_ROLES = ('Admin', 'Cashier')
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    """Verify against bcrypt (new) or Werkzeug (legacy) hashes."""
+    # Werkzeug hashes start with 'scrypt:' or 'pbkdf2:' or 'sha256$'
+    if hashed.startswith(('scrypt:', 'pbkdf2:', 'sha256$')):
+        return werkzeug_check(hashed, plain)
+    return pwd_context.verify(plain, hashed)
+
+
+def _needs_rehash(hashed: str) -> bool:
+    """Return True if the hash is a legacy Werkzeug hash."""
+    return hashed.startswith(('scrypt:', 'pbkdf2:', 'sha256$'))
+
+
+# ---------------------------------------------------------------------------
+# Request / Response schemas
+# ---------------------------------------------------------------------------
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    full_name: str
+    role: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    full_name: Optional[str] = None
+    active: Optional[bool] = None
+    role: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -55,27 +99,25 @@ def _assign_role(cur, user_id, role_name: str) -> None:
 # POST /api/register
 # ---------------------------------------------------------------------------
 
-@auth_bp.route('/register', methods=['POST'])
-def register():
-    data = request.get_json() or {}
-
-    username  = data.get('username', '').strip()
-    password  = data.get('password', '').strip()
-    full_name = data.get('full_name', '').strip()
-    role      = data.get('role', '').strip()
+@auth_router.post('/register', status_code=201)
+def register(body: RegisterRequest):
+    username  = body.username.strip()
+    password  = body.password.strip()
+    full_name = body.full_name.strip()
+    role      = body.role.strip()
 
     if not username or not password or not full_name:
-        return jsonify({'error': 'username, password, and full_name are required'}), 400
+        raise HTTPException(status_code=400, detail='username, password, and full_name are required')
 
     if not role or role not in VALID_ROLES:
-        return jsonify({'error': f'role is required and must be one of {VALID_ROLES}'}), 400
+        raise HTTPException(status_code=400, detail=f'role is required and must be one of {VALID_ROLES}')
 
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
-            return jsonify({'error': 'Username already exists'}), 409
+            raise HTTPException(status_code=409, detail='Username already exists')
 
         cur.execute(
             """
@@ -83,7 +125,7 @@ def register():
             VALUES (%s, %s, %s)
             RETURNING *
             """,
-            (username, generate_password_hash(password), full_name),
+            (username, pwd_context.hash(password), full_name),
         )
         user_row = cur.fetchone()
         _assign_role(cur, user_row['id'], role)
@@ -91,13 +133,16 @@ def register():
 
         user = _user_to_dict(user_row)
         user['role'] = role
-        return jsonify({'message': 'User created successfully', 'user': user}), 201
+        return {'message': 'User created successfully', 'user': user}
+    except HTTPException:
+        conn.rollback()
+        raise
     except ValueError as e:
         conn.rollback()
-        return jsonify({'error': str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         conn.rollback()
-        return jsonify({'error': str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         cur.close()
         release_connection(conn)
@@ -107,15 +152,13 @@ def register():
 # POST /api/login
 # ---------------------------------------------------------------------------
 
-@auth_bp.route('/login', methods=['POST'])
-def login():
-    data = request.get_json() or {}
-
-    username = data.get('username', '').strip()
-    password = data.get('password', '').strip()
+@auth_router.post('/login')
+def login(body: LoginRequest):
+    username = body.username.strip()
+    password = body.password.strip()
 
     if not username or not password:
-        return jsonify({'error': 'username and password are required'}), 400
+        raise HTTPException(status_code=400, detail='username and password are required')
 
     conn = get_connection()
     cur  = get_cursor(conn)
@@ -123,15 +166,23 @@ def login():
         cur.execute("SELECT * FROM users WHERE username = %s", (username,))
         user = cur.fetchone()
 
-        if user is None or not check_password_hash(user['password_hash'], password):
-            return jsonify({'error': 'Invalid username or password'}), 401
+        if user is None or not _verify_password(password, user['password_hash']):
+            raise HTTPException(status_code=401, detail='Invalid username or password')
 
         if not user['active']:
-            return jsonify({'error': 'Account is disabled'}), 403
+            raise HTTPException(status_code=403, detail='Account is disabled')
+
+        # Migrate legacy Werkzeug hash → bcrypt on first successful login
+        if _needs_rehash(user['password_hash']):
+            cur.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (pwd_context.hash(password), user['id']),
+            )
+            conn.commit()
 
         user_data = _user_to_dict(user)
         user_data['role'] = _get_user_role(cur, user['id'])
-        return jsonify({'message': 'Login successful', 'user': user_data}), 200
+        return {'message': 'Login successful', 'user': user_data}
     finally:
         cur.close()
         release_connection(conn)
@@ -141,34 +192,32 @@ def login():
 # PUT /api/users/<id>
 # ---------------------------------------------------------------------------
 
-@auth_bp.route('/users/<int:user_id>', methods=['PUT'])
-def update_user(user_id):
-    data = request.get_json() or {}
-
+@auth_router.put('/users/{user_id}')
+def update_user(user_id: int, body: UpdateUserRequest):
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
         cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
         if cur.fetchone() is None:
-            return jsonify({'error': 'User not found'}), 404
+            raise HTTPException(status_code=404, detail='User not found')
 
         fields, values = [], []
 
-        if data.get('full_name', '').strip():
+        if body.full_name and body.full_name.strip():
             fields.append("full_name = %s")
-            values.append(data['full_name'].strip())
+            values.append(body.full_name.strip())
 
-        if data.get('username', '').strip():
+        if body.username and body.username.strip():
             fields.append("username = %s")
-            values.append(data['username'].strip())
+            values.append(body.username.strip())
 
-        if data.get('password', '').strip():
+        if body.password and body.password.strip():
             fields.append("password_hash = %s")
-            values.append(generate_password_hash(data['password'].strip()))
+            values.append(pwd_context.hash(body.password.strip()))
 
-        if 'active' in data:
+        if body.active is not None:
             fields.append("active = %s")
-            values.append(bool(data['active']))
+            values.append(body.active)
 
         if fields:
             fields.append("updated_at = NOW()")
@@ -182,26 +231,29 @@ def update_user(user_id):
             cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             user_row = cur.fetchone()
 
-        new_role = data.get('role', '').strip()
+        new_role = body.role.strip() if body.role else ''
         if new_role:
             if new_role not in VALID_ROLES:
-                return jsonify({'error': f'role must be one of {VALID_ROLES}'}), 400
+                raise HTTPException(status_code=400, detail=f'role must be one of {VALID_ROLES}')
             _assign_role(cur, user_id, new_role)
 
         if not fields and not new_role:
-            return jsonify({'error': 'No valid fields provided to update'}), 400
+            raise HTTPException(status_code=400, detail='No valid fields provided to update')
 
         conn.commit()
 
         user = _user_to_dict(user_row)
         user['role'] = _get_user_role(cur, user_id)
-        return jsonify({'message': 'User updated successfully', 'user': user}), 200
+        return {'message': 'User updated successfully', 'user': user}
+    except HTTPException:
+        conn.rollback()
+        raise
     except ValueError as e:
         conn.rollback()
-        return jsonify({'error': str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         conn.rollback()
-        return jsonify({'error': str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         cur.close()
         release_connection(conn)
