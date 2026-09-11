@@ -2,19 +2,18 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from project root before anything else
+# Load .env for local dev (no-op on Vercel — env vars come from dashboard)
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
-import uvicorn
 from app import create_app
 
-env = os.environ.get('APP_ENV', 'default')
-app = create_app(env)
+app = create_app()
 
 if __name__ == '__main__':
+    import uvicorn
     uvicorn.run(
         'run:app',
         host='0.0.0.0',
         port=8000,
-        reload=True,  # local dev only — Vercel ignores this block
+        reload=True,
     )
