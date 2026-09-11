@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # no-op on Vercel (no .env file); env vars come from Vercel dashboard
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
