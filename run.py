@@ -1,4 +1,10 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root before anything else
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 import uvicorn
 from app import create_app
 

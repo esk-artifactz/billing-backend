@@ -7,6 +7,7 @@ from passlib.context import CryptContext
 from werkzeug.security import check_password_hash as werkzeug_check, generate_password_hash as werkzeug_hash
 
 from app.db import get_connection, release_connection, get_cursor
+from app.db_init import ensure_db
 
 auth_router = APIRouter()
 
@@ -101,6 +102,7 @@ def _assign_role(cur, user_id, role_name: str) -> None:
 
 @auth_router.post('/register', status_code=201)
 def register(body: RegisterRequest):
+    ensure_db()
     username  = body.username.strip()
     password  = body.password.strip()
     full_name = body.full_name.strip()
@@ -154,6 +156,7 @@ def register(body: RegisterRequest):
 
 @auth_router.post('/login')
 def login(body: LoginRequest):
+    ensure_db()
     username = body.username.strip()
     password = body.password.strip()
 
@@ -194,6 +197,7 @@ def login(body: LoginRequest):
 
 @auth_router.put('/users/{user_id}')
 def update_user(user_id: int, body: UpdateUserRequest):
+    ensure_db()
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
