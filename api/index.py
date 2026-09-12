@@ -5,8 +5,7 @@ from fastapi import FastAPI
 app = FastAPI()
 
 
-@app.get("/health")
-def health():
+def check_db():
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         return {"status": "unhealthy", "db": "disconnected", "error": "DATABASE_URL not set"}
@@ -17,3 +16,10 @@ def health():
         return {"status": "healthy", "db": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "db": "disconnected", "error": str(e)}
+
+
+@app.get("/")
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    return check_db()
