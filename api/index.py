@@ -245,7 +245,7 @@ def health():
         return JSONResponse(status_code=500, content={"status": "unhealthy", "error": str(e)})
 
 
-@app.post("/api/login")
+@app.post("/login")
 def login(body: LoginRequest):
     """
     Authenticate user and return a JWT token with role.
@@ -306,7 +306,7 @@ def login(body: LoginRequest):
 # Admin-only routes  (require Authorization: Bearer <token> with role=Admin)
 # ---------------------------------------------------------------------------
 
-@app.post("/api/register", status_code=201)
+@app.post("/register", status_code=201)
 def register(body: RegisterRequest, admin: dict = Depends(require_admin)):
     """
     Register a new user. Admin role required.
@@ -354,7 +354,7 @@ def register(body: RegisterRequest, admin: dict = Depends(require_admin)):
         cur.close(); conn.close()
 
 
-@app.get("/api/users")
+@app.get("/users")
 def list_users(admin: dict = Depends(require_admin)):
     """
     List all users. Admin role required.
@@ -377,7 +377,7 @@ def list_users(admin: dict = Depends(require_admin)):
         cur.close(); conn.close()
 
 
-@app.put("/api/users/{user_id}")
+@app.put("/users/{user_id}")
 def update_user(user_id: int, body: UpdateUserRequest, admin: dict = Depends(require_admin)):
     """
     Update a user. Admin role required.
