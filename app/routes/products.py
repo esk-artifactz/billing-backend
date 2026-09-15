@@ -61,7 +61,8 @@ def create_product():
     brand            = (body.get('brand') or '').strip()
     expiry_date      = body.get('expiry_date')
     price            = body.get('price', 0)
-    stock_quantity   = body.get('stock_quantity', 0)
+    track_stock      = body.get('track_stock', True)
+    stock_quantity   = body.get('stock_quantity')
     unit             = (body.get('unit') or 'pcs').strip()
     description      = (body.get('description') or '').strip()
 
@@ -69,6 +70,8 @@ def create_product():
         return jsonify({'detail': 'Product name is required'}), 400
     if not product_category:
         return jsonify({'detail': 'Product category is required'}), 400
+    if track_stock and (stock_quantity is None or stock_quantity == ""):
+        return jsonify({'detail': 'Stock quantity is required when track_stock is enabled'}), 400
 
     ensure_db()
     conn = get_connection()
@@ -86,11 +89,11 @@ def create_product():
 
         cur.execute(
             """
-            INSERT INTO products (item_id, product_category, subcategory, barcode, name, brand, expiry_date, price, stock_quantity, unit, description)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO products (item_id, product_category, subcategory, barcode, name, brand, expiry_date, price, track_stock, stock_quantity, unit, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
-            (item_id or None, product_category, subcategory or None, barcode or None, name, brand or None, expiry_date, price, stock_quantity, unit, description or None),
+            (item_id or None, product_category, subcategory or None, barcode or None, name, brand or None, expiry_date, price, track_stock, stock_quantity if track_stock else None, unit, description or None),
         )
         product_row = cur.fetchone()
         conn.commit()
@@ -128,6 +131,7 @@ def update_product(product_id: int):
         brand            = (body.get('brand') or '').strip()
         expiry_date      = body.get('expiry_date')
         price            = body.get('price')
+        track_stock      = body.get('track_stock')
         stock_quantity   = body.get('stock_quantity')
         unit             = (body.get('unit') or '').strip()
         description      = (body.get('description') or '').strip()
@@ -149,6 +153,8 @@ def update_product(product_id: int):
             fields.append("expiry_date = %s"); values.append(expiry_date)
         if price is not None:
             fields.append("price = %s"); values.append(price)
+        if track_stock is not None:
+            fields.append("track_stock = %s"); values.append(track_stock)
         if stock_quantity is not None:
             fields.append("stock_quantity = %s"); values.append(stock_quantity)
         if unit:
