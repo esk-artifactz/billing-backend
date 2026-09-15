@@ -228,7 +228,13 @@ def health():
 @app.post("/login")
 @app.post("/api/login")
 def login():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(force=True, silent=True)
+    if not body:
+        import json
+        try:
+            body = json.loads(request.data.decode("utf-8"))
+        except Exception:
+            body = {}
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
 
@@ -281,7 +287,13 @@ def register():
     if err_resp:
         return err_resp
 
-    body      = request.get_json(silent=True) or {}
+    body = request.get_json(force=True, silent=True)
+    if not body:
+        import json
+        try:
+            body = json.loads(request.data.decode("utf-8"))
+        except Exception:
+            body = {}
     username  = (body.get("username") or "").strip()
     password  = (body.get("password") or "").strip()
     full_name = (body.get("full_name") or "").strip()
@@ -356,7 +368,13 @@ def update_user(user_id: int):
         if not cur.fetchone():
             return jsonify({"detail": "User not found"}), 404
 
-        body = request.get_json(silent=True) or {}
+        body = request.get_json(force=True, silent=True)
+        if not body:
+            import json
+            try:
+                body = json.loads(request.data.decode("utf-8"))
+            except Exception:
+                body = {}
         fields, values = [], []
 
         full_name = (body.get("full_name") or "").strip()
