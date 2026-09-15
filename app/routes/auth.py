@@ -1,24 +1,31 @@
-from datetime import datetime
+import os
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+import jwt
+from flask import Blueprint, request, jsonify
 from passlib.context import CryptContext
-from werkzeug.security import check_password_hash as werkzeug_check, generate_password_hash as werkzeug_hash
+from werkzeug.security import check_password_hash as werkzeug_check
 
 from app.db import get_connection, release_connection, get_cursor
 from app.db_init import ensure_db
 
-auth_router = APIRouter()
+auth_bp = Blueprint('auth', __name__)
 
-VALID_ROLES = ('Admin', 'Cashier')
+VALID_ROLES   = ('Admin', 'Cashier')
+JWT_SECRET    = os.environ.get('SECRET_KEY', 'dev-secret-key')
+JWT_ALGORITHM = 'HS256'
+JWT_EXP_HOURS = 12
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
+# ---------------------------------------------------------------------------
+# Password helpers
+# ---------------------------------------------------------------------------
+
 def _verify_password(plain: str, hashed: str) -> bool:
     """Verify against bcrypt (new) or Werkzeug (legacy) hashes."""
-    # Werkzeug hashes start with 'scrypt:' or 'pbkdf2:' or 'sha256$'
     if hashed.startswith(('scrypt:', 'pbkdf2:', 'sha256$')):
         return werkzeug_check(hashed, plain)
     return pwd_context.verify(plain, hashed)
@@ -30,27 +37,50 @@ def _needs_rehash(hashed: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Request / Response schemas
+# JWT helpers
 # ---------------------------------------------------------------------------
 
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    full_name: str
-    role: str
+def _create_token(user_id: int, username: str, role: str) -> str:
+    payload = {
+        'sub': str(user_id),
+        'username': username,
+        'role': role,
+        'exp': datetime.now(timezone.utc) + timedelta(hours=JWT_EXP_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+def _decode_token(token: str):
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM]), None
+    except jwt.ExpiredSignatureError:
+        return None, 'Token has expired'
+    except jwt.InvalidTokenError:
+        return None, 'Invalid token'
 
 
-class UpdateUserRequest(BaseModel):
-    username: Optional[str] = None
-    password: Optional[str] = None
-    full_name: Optional[str] = None
-    active: Optional[bool] = None
-    role: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Auth middleware helpers
+# ---------------------------------------------------------------------------
+
+def _get_current_user():
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return None, (jsonify({'detail': 'Missing or invalid Authorization header'}), 401)
+    token = auth.split(' ', 1)[1]
+    payload, err = _decode_token(token)
+    if err:
+        return None, (jsonify({'detail': err}), 401)
+    return payload, None
+
+
+def _require_admin():
+    payload, err_resp = _get_current_user()
+    if err_resp:
+        return None, err_resp
+    if payload.get('role') != 'Admin':
+        return None, (jsonify({'detail': 'Admin role required'}), 403)
+    return payload, None
 
 
 # ---------------------------------------------------------------------------
@@ -100,26 +130,30 @@ def _assign_role(cur, user_id, role_name: str) -> None:
 # POST /api/register
 # ---------------------------------------------------------------------------
 
-@auth_router.post('/register', status_code=201)
-def register(body: RegisterRequest):
-    ensure_db()
-    username  = body.username.strip()
-    password  = body.password.strip()
-    full_name = body.full_name.strip()
-    role      = body.role.strip()
+@auth_bp.post('/register')
+def register():
+    admin, err_resp = _require_admin()
+    if err_resp:
+        return err_resp
+
+    body      = request.get_json(silent=True) or {}
+    username  = (body.get('username') or '').strip()
+    password  = (body.get('password') or '').strip()
+    full_name = (body.get('full_name') or '').strip()
+    role      = (body.get('role') or '').strip()
 
     if not username or not password or not full_name:
-        raise HTTPException(status_code=400, detail='username, password, and full_name are required')
-
+        return jsonify({'detail': 'username, password, and full_name are required'}), 400
     if not role or role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail=f'role is required and must be one of {VALID_ROLES}')
+        return jsonify({'detail': f'role is required and must be one of {VALID_ROLES}'}), 400
 
+    ensure_db()
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
-            raise HTTPException(status_code=409, detail='Username already exists')
+            return jsonify({'detail': 'Username already exists'}), 409
 
         cur.execute(
             """
@@ -135,16 +169,13 @@ def register(body: RegisterRequest):
 
         user = _user_to_dict(user_row)
         user['role'] = role
-        return {'message': 'User created successfully', 'user': user}
-    except HTTPException:
-        conn.rollback()
-        raise
+        return jsonify({'message': 'User created successfully', 'user': user}), 201
     except ValueError as e:
         conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        return jsonify({'detail': str(e)}), 400
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        return jsonify({'detail': str(e)}), 400
     finally:
         cur.close()
         release_connection(conn)
@@ -154,15 +185,16 @@ def register(body: RegisterRequest):
 # POST /api/login
 # ---------------------------------------------------------------------------
 
-@auth_router.post('/login')
-def login(body: LoginRequest):
-    ensure_db()
-    username = body.username.strip()
-    password = body.password.strip()
+@auth_bp.post('/login')
+def login():
+    body     = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip()
+    password = (body.get('password') or '').strip()
 
     if not username or not password:
-        raise HTTPException(status_code=400, detail='username and password are required')
+        return jsonify({'detail': 'username and password are required'}), 400
 
+    ensure_db()
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
@@ -170,10 +202,10 @@ def login(body: LoginRequest):
         user = cur.fetchone()
 
         if user is None or not _verify_password(password, user['password_hash']):
-            raise HTTPException(status_code=401, detail='Invalid username or password')
+            return jsonify({'detail': 'Invalid username or password'}), 401
 
         if not user['active']:
-            raise HTTPException(status_code=403, detail='Account is disabled')
+            return jsonify({'detail': 'Account is disabled'}), 403
 
         # Migrate legacy Werkzeug hash → bcrypt on first successful login
         if _needs_rehash(user['password_hash']):
@@ -183,9 +215,43 @@ def login(body: LoginRequest):
             )
             conn.commit()
 
+        role      = _get_user_role(cur, user['id'])
+        token     = _create_token(user['id'], user['username'], role)
         user_data = _user_to_dict(user)
-        user_data['role'] = _get_user_role(cur, user['id'])
-        return {'message': 'Login successful', 'user': user_data}
+        user_data['role'] = role
+
+        return jsonify({
+            'message':    'Login successful',
+            'token':      token,
+            'token_type': 'bearer',
+            'user':       user_data,
+        })
+    finally:
+        cur.close()
+        release_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/users
+# ---------------------------------------------------------------------------
+
+@auth_bp.get('/users')
+def list_users():
+    admin, err_resp = _require_admin()
+    if err_resp:
+        return err_resp
+
+    ensure_db()
+    conn = get_connection()
+    cur  = get_cursor(conn)
+    try:
+        cur.execute("SELECT * FROM users ORDER BY id")
+        users = []
+        for row in cur.fetchall():
+            u = _user_to_dict(row)
+            u['role'] = _get_user_role(cur, row['id'])
+            users.append(u)
+        return jsonify({'users': users, 'total': len(users)})
     finally:
         cur.close()
         release_connection(conn)
@@ -195,33 +261,37 @@ def login(body: LoginRequest):
 # PUT /api/users/<id>
 # ---------------------------------------------------------------------------
 
-@auth_router.put('/users/{user_id}')
-def update_user(user_id: int, body: UpdateUserRequest):
+@auth_bp.put('/users/<int:user_id>')
+def update_user(user_id: int):
+    admin, err_resp = _require_admin()
+    if err_resp:
+        return err_resp
+
     ensure_db()
     conn = get_connection()
     cur  = get_cursor(conn)
     try:
         cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
         if cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail='User not found')
+            return jsonify({'detail': 'User not found'}), 404
 
+        body     = request.get_json(silent=True) or {}
         fields, values = [], []
 
-        if body.full_name and body.full_name.strip():
-            fields.append("full_name = %s")
-            values.append(body.full_name.strip())
+        full_name = (body.get('full_name') or '').strip()
+        username  = (body.get('username') or '').strip()
+        password  = (body.get('password') or '').strip()
+        active    = body.get('active')
+        new_role  = (body.get('role') or '').strip()
 
-        if body.username and body.username.strip():
-            fields.append("username = %s")
-            values.append(body.username.strip())
-
-        if body.password and body.password.strip():
-            fields.append("password_hash = %s")
-            values.append(pwd_context.hash(body.password.strip()))
-
-        if body.active is not None:
-            fields.append("active = %s")
-            values.append(body.active)
+        if full_name:
+            fields.append("full_name = %s"); values.append(full_name)
+        if username:
+            fields.append("username = %s"); values.append(username)
+        if password:
+            fields.append("password_hash = %s"); values.append(pwd_context.hash(password))
+        if active is not None:
+            fields.append("active = %s"); values.append(active)
 
         if fields:
             fields.append("updated_at = NOW()")
@@ -235,29 +305,25 @@ def update_user(user_id: int, body: UpdateUserRequest):
             cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             user_row = cur.fetchone()
 
-        new_role = body.role.strip() if body.role else ''
         if new_role:
             if new_role not in VALID_ROLES:
-                raise HTTPException(status_code=400, detail=f'role must be one of {VALID_ROLES}')
+                return jsonify({'detail': f'role must be one of {VALID_ROLES}'}), 400
             _assign_role(cur, user_id, new_role)
 
         if not fields and not new_role:
-            raise HTTPException(status_code=400, detail='No valid fields provided to update')
+            return jsonify({'detail': 'No valid fields provided to update'}), 400
 
         conn.commit()
 
         user = _user_to_dict(user_row)
         user['role'] = _get_user_role(cur, user_id)
-        return {'message': 'User updated successfully', 'user': user}
-    except HTTPException:
-        conn.rollback()
-        raise
+        return jsonify({'message': 'User updated successfully', 'user': user})
     except ValueError as e:
         conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        return jsonify({'detail': str(e)}), 400
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        return jsonify({'detail': str(e)}), 400
     finally:
         cur.close()
         release_connection(conn)
