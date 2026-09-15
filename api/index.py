@@ -212,6 +212,24 @@ def _needs_rehash(hashed: str) -> bool:
 # Public routes
 # ---------------------------------------------------------------------------
 
+@app.route("/debug", methods=["POST", "GET"])
+def debug():
+    import json
+    raw = request.data
+    forced = request.get_json(force=True, silent=True)
+    silent = request.get_json(silent=True)
+    form   = dict(request.form)
+    headers = dict(request.headers)
+    return jsonify({
+        "raw_data": raw.decode("utf-8") if raw else "",
+        "get_json_force": forced,
+        "get_json_silent": silent,
+        "form": form,
+        "content_type": request.content_type,
+        "method": request.method,
+        "headers": {k: v for k, v in headers.items() if k in ["Content-Type", "Content-Length"]},
+    })
+
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/")
