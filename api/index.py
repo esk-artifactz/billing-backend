@@ -10,11 +10,8 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 import jwt
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from passlib.context import CryptContext
 from werkzeug.security import check_password_hash as werkzeug_check
 
@@ -22,15 +19,8 @@ from werkzeug.security import check_password_hash as werkzeug_check
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Crown Tea Hub Billing API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -42,7 +32,6 @@ JWT_ALGORITHM = "HS256"
 JWT_EXP_HOURS = 12
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer      = HTTPBearer()
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -135,26 +124,40 @@ def _decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(401, "Token has expired")
+        return None, "Token has expired"
     except jwt.InvalidTokenError:
-        raise HTTPException(401, "Invalid token")
+        return None, "Invalid token"
 
 
 # ---------------------------------------------------------------------------
-# Auth dependencies
+# Auth middleware helpers
 # ---------------------------------------------------------------------------
 
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
-    """Decode token and return payload. Any logged-in user passes."""
-    return _decode_token(creds.credentials)
+def _get_token_from_request():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, "Missing or invalid Authorization header"
+    token = auth.split(" ", 1)[1]
+    result = _decode_token(token)
+    if isinstance(result, tuple):
+        return None, result[1]
+    return result, None
 
 
-def require_admin(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
-    """Decode token and enforce Admin role."""
-    payload = _decode_token(creds.credentials)
+def require_auth():
+    payload, err = _get_token_from_request()
+    if err:
+        return None, (jsonify({"detail": err}), 401)
+    return payload, None
+
+
+def require_admin():
+    payload, err_resp = require_auth()
+    if err_resp:
+        return None, err_resp
     if payload.get("role") != "Admin":
-        raise HTTPException(403, "Admin role required")
-    return payload
+        return None, (jsonify({"detail": "Admin role required"}), 403)
+    return payload, None
 
 
 # ---------------------------------------------------------------------------
@@ -206,68 +209,33 @@ def _needs_rehash(hashed: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-
-class RegisterRequest(BaseModel):
-    username:  str
-    password:  str
-    full_name: str
-    role:      str
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class UpdateUserRequest(BaseModel):
-    username:  Optional[str]  = None
-    password:  Optional[str]  = None
-    full_name: Optional[str]  = None
-    active:    Optional[bool] = None
-    role:      Optional[str]  = None
-
-
-# ---------------------------------------------------------------------------
 # Public routes
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
+@app.get("/api/health")
 @app.get("/")
 def health():
     try:
         conn = get_conn()
         conn.cursor().execute("SELECT 1")
         conn.close()
-        return {"status": "healthy", "message": "Billing API is running", "db": "connected"}
+        return jsonify({"status": "healthy", "message": "Billing API is running", "db": "connected"})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "unhealthy", "error": str(e)})
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
 
 @app.post("/login")
-def login(body: LoginRequest):
-    """
-    Authenticate user and return a JWT token with role.
-
-    Request:
-        { "username": "...", "password": "..." }
-
-    Response:
-        {
-          "message": "Login successful",
-          "token": "<jwt>",
-          "token_type": "bearer",
-          "user": { "id", "username", "full_name", "role", "active", ... }
-        }
-    """
-    ensure_db()
-    username = body.username.strip()
-    password = body.password.strip()
+@app.post("/api/login")
+def login():
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
 
     if not username or not password:
-        raise HTTPException(400, "username and password are required")
+        return jsonify({"detail": "username and password are required"}), 400
 
+    ensure_db()
     conn = get_conn()
     cur  = get_cur(conn)
     try:
@@ -275,9 +243,9 @@ def login(body: LoginRequest):
         user = cur.fetchone()
 
         if not user or not _verify_password(password, user["password_hash"]):
-            raise HTTPException(401, "Invalid username or password")
+            return jsonify({"detail": "Invalid username or password"}), 401
         if not user["active"]:
-            raise HTTPException(403, "Account is disabled")
+            return jsonify({"detail": "Account is disabled"}), 403
 
         # Migrate legacy Werkzeug hash → bcrypt on first successful login
         if _needs_rehash(user["password_hash"]):
@@ -292,12 +260,12 @@ def login(body: LoginRequest):
         user_data = _user_to_dict(user)
         user_data["role"] = role
 
-        return {
+        return jsonify({
             "message":    "Login successful",
             "token":      token,
             "token_type": "bearer",
             "user":       user_data,
-        }
+        })
     finally:
         cur.close(); conn.close()
 
@@ -306,34 +274,31 @@ def login(body: LoginRequest):
 # Admin-only routes  (require Authorization: Bearer <token> with role=Admin)
 # ---------------------------------------------------------------------------
 
-@app.post("/register", status_code=201)
-def register(body: RegisterRequest, admin: dict = Depends(require_admin)):
-    """
-    Register a new user. Admin role required.
+@app.post("/register")
+@app.post("/api/register")
+def register():
+    admin, err_resp = require_admin()
+    if err_resp:
+        return err_resp
 
-    Headers:
-        Authorization: Bearer <token>
-
-    Request:
-        { "username": "...", "password": "...", "full_name": "...", "role": "Admin|Cashier" }
-    """
-    ensure_db()
-    username  = body.username.strip()
-    password  = body.password.strip()
-    full_name = body.full_name.strip()
-    role      = body.role.strip()
+    body      = request.get_json(silent=True) or {}
+    username  = (body.get("username") or "").strip()
+    password  = (body.get("password") or "").strip()
+    full_name = (body.get("full_name") or "").strip()
+    role      = (body.get("role") or "").strip()
 
     if not username or not password or not full_name:
-        raise HTTPException(400, "username, password, and full_name are required")
+        return jsonify({"detail": "username, password, and full_name are required"}), 400
     if role not in VALID_ROLES:
-        raise HTTPException(400, f"role must be one of {VALID_ROLES}")
+        return jsonify({"detail": f"role must be one of {VALID_ROLES}"}), 400
 
+    ensure_db()
     conn = get_conn()
     cur  = get_cur(conn)
     try:
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
-            raise HTTPException(409, "Username already exists")
+            return jsonify({"detail": "Username already exists"}), 409
         cur.execute(
             "INSERT INTO users (username, password_hash, full_name) VALUES (%s, %s, %s) RETURNING *",
             (username, pwd_context.hash(password), full_name),
@@ -343,25 +308,24 @@ def register(body: RegisterRequest, admin: dict = Depends(require_admin)):
         conn.commit()
         user = _user_to_dict(user_row)
         user["role"] = role
-        return {"message": "User created successfully", "user": user}
-    except HTTPException:
-        conn.rollback(); raise
+        return jsonify({"message": "User created successfully", "user": user}), 201
     except ValueError as e:
-        conn.rollback(); raise HTTPException(400, str(e))
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
     except Exception as e:
-        conn.rollback(); raise HTTPException(400, str(e))
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
     finally:
         cur.close(); conn.close()
 
 
 @app.get("/users")
-def list_users(admin: dict = Depends(require_admin)):
-    """
-    List all users. Admin role required.
+@app.get("/api/users")
+def list_users():
+    admin, err_resp = require_admin()
+    if err_resp:
+        return err_resp
 
-    Headers:
-        Authorization: Bearer <token>
-    """
     ensure_db()
     conn = get_conn()
     cur  = get_cur(conn)
@@ -372,36 +336,43 @@ def list_users(admin: dict = Depends(require_admin)):
             u = _user_to_dict(row)
             u["role"] = _get_user_role(cur, row["id"])
             users.append(u)
-        return {"users": users, "total": len(users)}
+        return jsonify({"users": users, "total": len(users)})
     finally:
         cur.close(); conn.close()
 
 
-@app.put("/users/{user_id}")
-def update_user(user_id: int, body: UpdateUserRequest, admin: dict = Depends(require_admin)):
-    """
-    Update a user. Admin role required.
+@app.put("/users/<int:user_id>")
+@app.put("/api/users/<int:user_id>")
+def update_user(user_id: int):
+    admin, err_resp = require_admin()
+    if err_resp:
+        return err_resp
 
-    Headers:
-        Authorization: Bearer <token>
-    """
     ensure_db()
     conn = get_conn()
     cur  = get_cur(conn)
     try:
         cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
         if not cur.fetchone():
-            raise HTTPException(404, "User not found")
+            return jsonify({"detail": "User not found"}), 404
 
+        body = request.get_json(silent=True) or {}
         fields, values = [], []
-        if body.full_name and body.full_name.strip():
-            fields.append("full_name = %s"); values.append(body.full_name.strip())
-        if body.username and body.username.strip():
-            fields.append("username = %s"); values.append(body.username.strip())
-        if body.password and body.password.strip():
-            fields.append("password_hash = %s"); values.append(pwd_context.hash(body.password.strip()))
-        if body.active is not None:
-            fields.append("active = %s"); values.append(body.active)
+
+        full_name = (body.get("full_name") or "").strip()
+        username  = (body.get("username") or "").strip()
+        password  = (body.get("password") or "").strip()
+        active    = body.get("active")
+        new_role  = (body.get("role") or "").strip()
+
+        if full_name:
+            fields.append("full_name = %s"); values.append(full_name)
+        if username:
+            fields.append("username = %s"); values.append(username)
+        if password:
+            fields.append("password_hash = %s"); values.append(pwd_context.hash(password))
+        if active is not None:
+            fields.append("active = %s"); values.append(active)
 
         if fields:
             fields.append("updated_at = NOW()")
@@ -412,24 +383,23 @@ def update_user(user_id: int, body: UpdateUserRequest, admin: dict = Depends(req
             cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             user_row = cur.fetchone()
 
-        new_role = body.role.strip() if body.role else ""
         if new_role:
             if new_role not in VALID_ROLES:
-                raise HTTPException(400, f"role must be one of {VALID_ROLES}")
+                return jsonify({"detail": f"role must be one of {VALID_ROLES}"}), 400
             _assign_role(cur, user_id, new_role)
 
         if not fields and not new_role:
-            raise HTTPException(400, "No valid fields provided to update")
+            return jsonify({"detail": "No valid fields provided to update"}), 400
 
         conn.commit()
         user = _user_to_dict(user_row)
         user["role"] = _get_user_role(cur, user_id)
-        return {"message": "User updated successfully", "user": user}
-    except HTTPException:
-        conn.rollback(); raise
+        return jsonify({"message": "User updated successfully", "user": user})
     except ValueError as e:
-        conn.rollback(); raise HTTPException(400, str(e))
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
     except Exception as e:
-        conn.rollback(); raise HTTPException(400, str(e))
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
     finally:
         cur.close(); conn.close()
