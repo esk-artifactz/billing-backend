@@ -281,11 +281,13 @@ def require_admin():
 # ---------------------------------------------------------------------------
 
 def _product_to_dict(row: dict) -> dict:
-    """Return a safe product dict."""
+    """Return a safe product dict. Booleans must be checked before numeric types."""
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, datetime):
             d[k] = v.isoformat()
+        elif isinstance(v, bool):
+            d[k] = bool(v)          # keep True/False, do NOT cast to float
         elif isinstance(v, float):
             d[k] = float(v)
     return d
@@ -862,10 +864,13 @@ def delete_product(product_id: int):
 # ---------------------------------------------------------------------------
 
 def _row_to_dict(row):
+    """Convert DB row to dict. Booleans checked before numeric to avoid True→1.0."""
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, datetime):
             d[k] = v.isoformat()
+        elif isinstance(v, bool):
+            d[k] = bool(v)          # keep True/False, do NOT cast to float
         elif hasattr(v, '__float__'):
             d[k] = float(v)
     return d
