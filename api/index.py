@@ -168,6 +168,11 @@ def ensure_db():
                 ALTER TABLE sales
                 ADD COLUMN IF NOT EXISTS change_amount NUMERIC(12,2)
             """)
+            # Ensure sale_time has a default on existing tables (was NOT NULL but no DEFAULT)
+            cur.execute("""
+                ALTER TABLE sales
+                ALTER COLUMN sale_time SET DEFAULT CURRENT_TIMESTAMP
+            """)
             # held_sales
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS held_sales (
@@ -1002,11 +1007,11 @@ def checkout():
 
         invoice_number = _generate_invoice_number(cur)
 
-        # Insert sale
+        # Insert sale — sale_time passed explicitly to avoid NOT NULL issues on existing tables
         cur.execute(
             """
-            INSERT INTO sales (invoice_number, cashier_username, subtotal, discount_total, tax_total, round_off, grand_total, payment_method, amount_tendered, change_amount, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
+            INSERT INTO sales (invoice_number, cashier_username, sale_time, subtotal, discount_total, tax_total, round_off, grand_total, payment_method, amount_tendered, change_amount, status)
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
             RETURNING *
             """,
             (invoice_number, cashier_username, round(subtotal, 2), round(discount_total, 2),
