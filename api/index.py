@@ -986,8 +986,9 @@ def checkout():
                  item["quantity"], item["unit_price"], item["discount_amount"],
                  item["tax_amount"], item["line_total"]),
             )
-            # Deduct stock if tracked
-            if item["track_stock"] and item["current_stock"] is not None:
+            # Only deduct stock for products where track_stock = TRUE
+            # Non-stockable items (Tea, Coffee, Juice, etc.) are skipped entirely
+            if item["track_stock"] is True and item["current_stock"] is not None:
                 stock_before = float(item["current_stock"])
                 stock_after  = max(0.0, stock_before - item["quantity"])
                 cur.execute(
@@ -1002,6 +1003,7 @@ def checkout():
                     (item["product_id"], -item["quantity"], stock_before, stock_after,
                      invoice_number, f"Sale: {invoice_number}"),
                 )
+            # If track_stock = FALSE → skip stock update and inventory log entirely
 
         conn.commit()
         return jsonify({
