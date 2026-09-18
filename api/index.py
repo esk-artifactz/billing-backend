@@ -61,6 +61,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
+_db_version = 3   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -132,6 +133,41 @@ def ensure_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_products_brand ON products(brand)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)")
+
+            # ── Column migrations (safe ALTER TABLE for existing tables) ──────
+            # Add track_stock if missing (tables created before this column was added)
+            cur.execute("""
+                ALTER TABLE products
+                ADD COLUMN IF NOT EXISTS track_stock BOOLEAN NOT NULL DEFAULT TRUE
+            """)
+            # Add quick_sale_enabled if missing
+            cur.execute("""
+                ALTER TABLE products
+                ADD COLUMN IF NOT EXISTS quick_sale_enabled BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+            # Add minimum_stock_level if missing
+            cur.execute("""
+                ALTER TABLE products
+                ADD COLUMN IF NOT EXISTS minimum_stock_level NUMERIC(12,3)
+            """)
+            # Add current_stock if missing
+            cur.execute("""
+                ALTER TABLE products
+                ADD COLUMN IF NOT EXISTS current_stock NUMERIC(12,3)
+            """)
+            # Add payment_method + amount_tendered + change_amount to sales if missing
+            cur.execute("""
+                ALTER TABLE sales
+                ADD COLUMN IF NOT EXISTS payment_method VARCHAR(30) NOT NULL DEFAULT 'cash'
+            """)
+            cur.execute("""
+                ALTER TABLE sales
+                ADD COLUMN IF NOT EXISTS amount_tendered NUMERIC(12,2)
+            """)
+            cur.execute("""
+                ALTER TABLE sales
+                ADD COLUMN IF NOT EXISTS change_amount NUMERIC(12,2)
+            """)
             # held_sales
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS held_sales (
@@ -955,8 +991,8 @@ def checkout():
                 "discount_amount": discount_amount,
                 "tax_amount":      tax_amount,
                 "line_total":      line_total,
-                "track_stock":     product["track_stock"],
-                "current_stock":   product["current_stock"],
+                "track_stock":     product.get("track_stock", True),   # default True if column missing
+                "current_stock":   product.get("current_stock"),
             })
 
         grand_before_round = subtotal - discount_total + tax_total
@@ -993,7 +1029,7 @@ def checkout():
             )
             # Only deduct stock for products where track_stock = TRUE
             # Non-stockable items (Tea, Coffee, Juice, etc.) are skipped entirely
-            if item["track_stock"] is True and item["current_stock"] is not None:
+            if item.get("track_stock", True) is True and item.get("current_stock") is not None:
                 stock_before = float(item["current_stock"])
                 stock_after  = max(0.0, stock_before - item["quantity"])
                 cur.execute(
