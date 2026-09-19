@@ -1679,3 +1679,85 @@ def delete_credit_bill(bill_id: int):
         return jsonify({"detail": str(e)}), 500
     finally:
         cur.close(); conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Stock Alerts — low stock items  (GET /api/stock/alerts)
+# ---------------------------------------------------------------------------
+
+@app.get("/stock/alerts")
+@app.get("/api/stock/alerts")
+def stock_alerts():
+    payload, err_resp = require_auth()
+    if err_resp:
+        return err_resp
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        # Out of stock: track_stock=true, current_stock = 0 (or null)
+        cur.execute("""
+            SELECT
+                p.id, p.name, p.unit, p.current_stock, p.minimum_stock_level,
+                c.name AS category_name
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.active = TRUE
+              AND p.track_stock = TRUE
+              AND (p.current_stock IS NULL OR p.current_stock <= 0)
+            ORDER BY c.name, p.name
+        """)
+        out_of_stock = []
+        for r in cur.fetchall():
+            out_of_stock.append({
+                "id":                  r["id"],
+                "name":                r["name"],
+                "unit":                r["unit"],
+                "current_stock":       float(r["current_stock"] or 0),
+                "minimum_stock_level": float(r["minimum_stock_level"] or 0),
+                "category_name":       r["category_name"] or "Uncategorised",
+            })
+
+        # Low stock: track_stock=true, current_stock > 0 but <= minimum_stock_level
+        cur.execute("""
+            SELECT
+                p.id, p.name, p.unit, p.current_stock, p.minimum_stock_level,
+                c.name AS category_name
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.active = TRUE
+              AND p.track_stock = TRUE
+              AND p.current_stock  > 0
+              AND p.minimum_stock_level IS NOT NULL
+              AND p.minimum_stock_level > 0
+              AND p.current_stock <= p.minimum_stock_level
+            ORDER BY (p.current_stock / p.minimum_stock_level) ASC, p.name
+        """)
+        low_stock = []
+        for r in cur.fetchall():
+            low_stock.append({
+                "id":                  r["id"],
+                "name":                r["name"],
+                "unit":                r["unit"],
+                "current_stock":       float(r["current_stock"]),
+                "minimum_stock_level": float(r["minimum_stock_level"]),
+                "category_name":       r["category_name"] or "Uncategorised",
+            })
+
+        # Summary counts
+        cur.execute("""
+            SELECT COUNT(*) AS total_tracked
+            FROM products
+            WHERE active = TRUE AND track_stock = TRUE
+        """)
+        total_tracked = int(cur.fetchone()["total_tracked"])
+
+        return jsonify({
+            "out_of_stock":  out_of_stock,
+            "low_stock":     low_stock,
+            "total_tracked": total_tracked,
+            "total_alerts":  len(out_of_stock) + len(low_stock),
+        })
+    finally:
+        cur.close(); conn.close()
