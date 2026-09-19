@@ -1276,3 +1276,91 @@ def list_sales():
         return jsonify({"sales": sales, "total": len(sales)})
     finally:
         cur.close(); conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Category-wise sales stats (GET /api/billing/stats/categories)
+# ---------------------------------------------------------------------------
+
+@app.get("/billing/stats/categories")
+@app.get("/api/billing/stats/categories")
+def category_sales_stats():
+    payload, err_resp = require_auth()
+    if err_resp:
+        return err_resp
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        # Total qty + revenue per category, joined via products → categories
+        cur.execute("""
+            SELECT
+                c.id                            AS category_id,
+                c.name                          AS category_name,
+                COUNT(DISTINCT si.sale_id)      AS total_orders,
+                COALESCE(SUM(si.quantity), 0)   AS total_qty,
+                COALESCE(SUM(si.line_total), 0) AS total_revenue
+            FROM categories c
+            LEFT JOIN products p ON p.category_id = c.id
+            LEFT JOIN sale_items si ON si.product_id = p.id
+            GROUP BY c.id, c.name
+            ORDER BY total_qty DESC
+        """)
+        rows = cur.fetchall()
+        stats = []
+        for r in rows:
+            stats.append({
+                "category_id":   r["category_id"],
+                "category_name": r["category_name"],
+                "total_orders":  int(r["total_orders"]),
+                "total_qty":     float(r["total_qty"]),
+                "total_revenue": float(r["total_revenue"]),
+            })
+
+        # Top 5 best-selling products overall
+        cur.execute("""
+            SELECT
+                p.name                          AS product_name,
+                c.name                          AS category_name,
+                COALESCE(SUM(si.quantity), 0)   AS total_qty,
+                COALESCE(SUM(si.line_total), 0) AS total_revenue
+            FROM sale_items si
+            JOIN products p ON p.id = si.product_id
+            JOIN categories c ON c.id = p.category_id
+            GROUP BY p.id, p.name, c.name
+            ORDER BY total_qty DESC
+            LIMIT 10
+        """)
+        top_products = []
+        for r in cur.fetchall():
+            top_products.append({
+                "product_name":  r["product_name"],
+                "category_name": r["category_name"],
+                "total_qty":     float(r["total_qty"]),
+                "total_revenue": float(r["total_revenue"]),
+            })
+
+        # Overall summary
+        cur.execute("""
+            SELECT
+                COUNT(*)                        AS total_sales,
+                COALESCE(SUM(grand_total), 0)   AS total_revenue,
+                COALESCE(SUM(tax_total), 0)     AS total_tax
+            FROM sales
+            WHERE status = 'completed'
+        """)
+        summary_row = cur.fetchone()
+        summary = {
+            "total_sales":   int(summary_row["total_sales"]),
+            "total_revenue": float(summary_row["total_revenue"]),
+            "total_tax":     float(summary_row["total_tax"]),
+        }
+
+        return jsonify({
+            "summary":      summary,
+            "by_category":  stats,
+            "top_products": top_products,
+        })
+    finally:
+        cur.close(); conn.close()
