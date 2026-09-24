@@ -1917,6 +1917,68 @@ def stock_alerts():
                 "category_name":       r["category_name"] or "Uncategorised",
             })
 
+        # Already expired: expiry_date < today
+        cur.execute("""
+            SELECT
+                p.id, p.name, p.unit, p.brand, p.current_stock,
+                p.expiry_date, p.mfg_date,
+                c.name AS category_name,
+                s.name AS supplier_name
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            LEFT JOIN suppliers  s ON s.id = p.supplier_id
+            WHERE p.active = TRUE
+              AND p.expiry_date IS NOT NULL
+              AND p.expiry_date < CURRENT_DATE
+            ORDER BY p.expiry_date ASC, p.name
+        """)
+        already_expired = []
+        for r in cur.fetchall():
+            already_expired.append({
+                "id":            r["id"],
+                "name":          r["name"],
+                "unit":          r["unit"],
+                "brand":         r["brand"],
+                "current_stock": float(r["current_stock"] or 0),
+                "expiry_date":   r["expiry_date"].isoformat() if r["expiry_date"] else None,
+                "mfg_date":      r["mfg_date"].isoformat()    if r["mfg_date"]    else None,
+                "category_name": r["category_name"] or "Uncategorised",
+                "supplier_name": r["supplier_name"],
+                "days_left":     (r["expiry_date"] - __import__('datetime').date.today()).days,
+            })
+
+        # Expiring soon: 0 < days until expiry <= 7
+        cur.execute("""
+            SELECT
+                p.id, p.name, p.unit, p.brand, p.current_stock,
+                p.expiry_date, p.mfg_date,
+                c.name AS category_name,
+                s.name AS supplier_name,
+                (p.expiry_date - CURRENT_DATE) AS days_left
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            LEFT JOIN suppliers  s ON s.id = p.supplier_id
+            WHERE p.active = TRUE
+              AND p.expiry_date IS NOT NULL
+              AND p.expiry_date >= CURRENT_DATE
+              AND p.expiry_date <= CURRENT_DATE + INTERVAL '7 days'
+            ORDER BY p.expiry_date ASC, p.name
+        """)
+        expiry_soon = []
+        for r in cur.fetchall():
+            expiry_soon.append({
+                "id":            r["id"],
+                "name":          r["name"],
+                "unit":          r["unit"],
+                "brand":         r["brand"],
+                "current_stock": float(r["current_stock"] or 0),
+                "expiry_date":   r["expiry_date"].isoformat() if r["expiry_date"] else None,
+                "mfg_date":      r["mfg_date"].isoformat()    if r["mfg_date"]    else None,
+                "category_name": r["category_name"] or "Uncategorised",
+                "supplier_name": r["supplier_name"],
+                "days_left":     int(r["days_left"]),
+            })
+
         # Summary counts
         cur.execute("""
             SELECT COUNT(*) AS total_tracked
@@ -1926,10 +1988,13 @@ def stock_alerts():
         total_tracked = int(cur.fetchone()["total_tracked"])
 
         return jsonify({
-            "out_of_stock":  out_of_stock,
-            "low_stock":     low_stock,
-            "total_tracked": total_tracked,
-            "total_alerts":  len(out_of_stock) + len(low_stock),
+            "out_of_stock":    out_of_stock,
+            "low_stock":       low_stock,
+            "already_expired": already_expired,
+            "expiry_soon":     expiry_soon,
+            "total_tracked":   total_tracked,
+            "total_alerts":    len(out_of_stock) + len(low_stock),
+            "total_expiry_alerts": len(already_expired) + len(expiry_soon),
         })
     finally:
         cur.close(); conn.close()
