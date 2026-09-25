@@ -455,8 +455,8 @@ def ensure_db():
                     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
                 )
             """)
-            cur.execute("SELECT COUNT(*) AS n FROM contact_categories")
-            if cur.fetchone()["n"] == 0:
+            cur.execute("SELECT COUNT(*) FROM contact_categories")
+            if cur.fetchone()[0] == 0:
                 cat_defaults = [
                     ("Gas Agency",          "#f97316", "🔥"),
                     ("Ice Cream Vendor",    "#06b6d4", "🍦"),
@@ -509,8 +509,8 @@ def ensure_db():
                 )
             """)
             # Seed default categories if table is empty
-            cur.execute("SELECT COUNT(*) AS n FROM expense_categories")
-            if cur.fetchone()["n"] == 0:
+            cur.execute("SELECT COUNT(*) FROM expense_categories")
+            if cur.fetchone()[0] == 0:
                 defaults = [
                     ("Supplier Payment",       "Payments made to suppliers / vendors",             "#d97706", 1),
                     ("Vegetables & Produce",   "Fresh vegetables, fruits and produce",              "#16a34a", 2),
