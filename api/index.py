@@ -1,5 +1,6 @@
 import os
 import urllib.parse
+from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,10 @@ VALID_ROLES   = ("Admin", "Cashier")
 JWT_SECRET    = os.environ.get("SECRET_KEY", "dev-secret-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXP_HOURS = 12
+
+# Shop timezone — sale_time is stored in the DB server's timezone (UTC on
+# cloud Postgres) but business dates are always evaluated in IST.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -653,6 +658,8 @@ def _product_to_dict(row: dict) -> dict:
             d[k] = v.isoformat()
         elif isinstance(v, bool):
             d[k] = bool(v)          # keep True/False, do NOT cast to float
+        elif isinstance(v, Decimal):
+            d[k] = float(v)         # NUMERIC columns -> proper JSON numbers
         elif isinstance(v, float):
             d[k] = float(v)
     return d
@@ -1622,12 +1629,48 @@ def list_sales():
     if err_resp:
         return err_resp
 
+    # Optional filters: ?date=YYYY-MM-DD, ?search=<invoice/customer/cashier>
+    date_filter = (request.args.get("date") or "").strip()
+    search      = (request.args.get("search") or "").strip()
+    limit       = min(int(request.args.get("limit", 500) or 500), 1000)
+
+    # Date comparisons are done in IST: convert the stored UTC timestamp
+    # to IST before taking the DATE part.
+    IST_DATE = "(sale_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::DATE"
+
+    where, params = ["1=1"], []
+    if payload.get("role") == "Cashier":
+        # Cashiers can only see today's bills — date param is ignored
+        today_ist = datetime.now(timezone.utc).astimezone(IST).strftime("%Y-%m-%d")
+        where.append(f"{IST_DATE} = %s"); params.append(today_ist)
+    elif date_filter:
+        where.append(f"{IST_DATE} = %s"); params.append(date_filter)
+    if search:
+        where.append("(invoice_number ILIKE %s OR customer_name ILIKE %s OR customer_mobile ILIKE %s OR cashier_username ILIKE %s)")
+        like = f"%{search}%"
+        params += [like, like, like, like]
+
     ensure_db()
     conn = get_conn()
     cur  = get_cur(conn)
     try:
-        cur.execute("SELECT * FROM sales ORDER BY sale_time DESC LIMIT 100")
+        cur.execute(
+            f"SELECT * FROM sales WHERE {' AND '.join(where)} ORDER BY sale_time DESC LIMIT %s",
+            params + [limit]
+        )
         sales = [_row_to_dict(r) for r in cur.fetchall()]
+        # Item counts per sale for the list view
+        if sales:
+            ids = [s["id"] for s in sales]
+            cur.execute(
+                "SELECT sale_id, COUNT(*) AS n, SUM(quantity) AS qty FROM sale_items WHERE sale_id = ANY(%s) GROUP BY sale_id",
+                (ids,)
+            )
+            counts = {r["sale_id"]: r for r in cur.fetchall()}
+            for s in sales:
+                c = counts.get(s["id"])
+                s["item_count"]  = int(c["n"]) if c else 0
+                s["total_qty"]   = float(c["qty"]) if c else 0
         return jsonify({"sales": sales, "total": len(sales)})
     finally:
         cur.close(); conn.close()
