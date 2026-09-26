@@ -66,7 +66,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
-_db_version = 3   # bump this to force re-run migrations on next cold start
+_db_version = 4   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -308,6 +308,15 @@ def ensure_db():
             # Add customer_name / customer_mobile to sales for optional display on receipt
             cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_name   VARCHAR(150)")
             cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_mobile VARCHAR(20)")
+
+            # Ensure held_sale_items FK cascades — older DBs created it without
+            # ON DELETE CASCADE, which blocks deleting held_sales (FK violation)
+            cur.execute("ALTER TABLE held_sale_items DROP CONSTRAINT IF EXISTS fk_held_sale_items_held_sale")
+            cur.execute("""
+                ALTER TABLE held_sale_items
+                ADD CONSTRAINT fk_held_sale_items_held_sale
+                FOREIGN KEY (held_sale_id) REFERENCES held_sales(id) ON DELETE CASCADE
+            """)
 
             # ── employees table ───────────────────────────────────────────────
             cur.execute("""
@@ -1632,6 +1641,8 @@ def delete_held_sale(hold_reference):
         held = cur.fetchone()
         if not held:
             return jsonify({"detail": "Held sale not found"}), 404
+        # Delete children first — the live FK may not have ON DELETE CASCADE
+        cur.execute("DELETE FROM held_sale_items WHERE held_sale_id = %s", (held["id"],))
         cur.execute("DELETE FROM held_sales WHERE id = %s", (held["id"],))
         conn.commit()
         return jsonify({"message": "Held sale deleted"})
