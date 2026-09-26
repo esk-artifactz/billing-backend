@@ -1471,6 +1471,7 @@ def hold_sale():
     items            = body.get("items", [])
     discount_total   = float(body.get("discount_total", 0))
     cashier_username = payload.get("username", "unknown")
+    hold_reference   = (body.get("hold_reference") or "").strip()   # set => update existing hold
 
     if not items:
         return jsonify({"detail": "Cart is empty"}), 400
@@ -1506,20 +1507,40 @@ def hold_sale():
                 "line_total":      line_total,
             })
 
-        grand_total      = round(subtotal - discount_total + tax_total, 2)
-        hold_reference   = _generate_hold_reference(cur)
+        grand_total = round(subtotal - discount_total + tax_total, 2)
 
-        cur.execute(
-            """
-            INSERT INTO held_sales (hold_reference, cashier_username, subtotal, discount_total, tax_total, grand_total)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING *
-            """,
-            (hold_reference, cashier_username, round(subtotal, 2),
-             round(discount_total, 2), round(tax_total, 2), grand_total),
-        )
-        held = cur.fetchone()
-        held_id = held["id"]
+        if hold_reference:
+            # Re-holding a retrieved bill — update it in place, don't duplicate
+            cur.execute("SELECT * FROM held_sales WHERE hold_reference = %s", (hold_reference,))
+            held = cur.fetchone()
+            if not held:
+                return jsonify({"detail": "Held sale not found"}), 404
+            held_id = held["id"]
+            cur.execute(
+                """
+                UPDATE held_sales
+                SET subtotal = %s, discount_total = %s, tax_total = %s,
+                    grand_total = %s, updated_at = NOW()
+                WHERE id = %s RETURNING *
+                """,
+                (round(subtotal, 2), round(discount_total, 2), round(tax_total, 2),
+                 grand_total, held_id),
+            )
+            held = cur.fetchone()
+            cur.execute("DELETE FROM held_sale_items WHERE held_sale_id = %s", (held_id,))
+        else:
+            hold_reference = _generate_hold_reference(cur)
+            cur.execute(
+                """
+                INSERT INTO held_sales (hold_reference, cashier_username, subtotal, discount_total, tax_total, grand_total)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (hold_reference, cashier_username, round(subtotal, 2),
+                 round(discount_total, 2), round(tax_total, 2), grand_total),
+            )
+            held = cur.fetchone()
+            held_id = held["id"]
 
         for item in enriched:
             cur.execute(
