@@ -2552,8 +2552,8 @@ def attendance_report():
             half       = int(r["half_days"])
             leave      = int(r["leave_days"])
             daily_rate = float(r["daily_rate"])
-            # effective days: present=1, half_day=0.5, leave=1 (paid leave), absent=0
-            effective  = present + half * 0.5 + leave
+            # effective days: present=1, half_day=0.5, leave=0 (unpaid), absent=0
+            effective  = present + half * 0.5
             earned     = round(daily_rate * effective, 2)
             report.append({
                 "employee_id":  r["employee_id"],
