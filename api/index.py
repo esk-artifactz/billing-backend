@@ -1,7 +1,7 @@
 import os
 import urllib.parse
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -665,6 +665,8 @@ def _product_to_dict(row: dict) -> dict:
     for k, v in d.items():
         if isinstance(v, datetime):
             d[k] = v.isoformat()
+        elif isinstance(v, date):
+            d[k] = v.isoformat()    # DATE columns -> "2025-09-25"
         elif isinstance(v, bool):
             d[k] = bool(v)          # keep True/False, do NOT cast to float
         elif isinstance(v, Decimal):
@@ -1302,6 +1304,8 @@ def _row_to_dict(row):
     for k, v in d.items():
         if isinstance(v, datetime):
             d[k] = v.isoformat()
+        elif isinstance(v, date):
+            d[k] = v.isoformat()    # DATE columns -> "2025-09-25"
         elif isinstance(v, bool):
             d[k] = bool(v)          # keep True/False, do NOT cast to float
         elif hasattr(v, '__float__'):
