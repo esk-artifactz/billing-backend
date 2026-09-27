@@ -2707,6 +2707,33 @@ def list_salary_payments():
             (employee_id, pay_month),
         )
         payments = [_emp_to_dict(r) for r in cur.fetchall()]
+
+        # Salary/wage payments logged via Daily Expenses for this employee+month —
+        # merged in so the salary history matches the balance shown in the report
+        cur.execute(
+            """
+            SELECT id, expense_date, category, description, amount, recorded_by, created_at
+            FROM daily_expenses
+            WHERE employee_id = %s AND TO_CHAR(expense_date, 'YYYY-MM') = %s
+            ORDER BY expense_date, created_at
+            """,
+            (employee_id, pay_month),
+        )
+        for r in cur.fetchall():
+            d = _emp_to_dict(r)
+            payments.append({
+                "id":           f"exp-{d['id']}",   # prefixed — not a salary_payments id
+                "employee_id":  int(employee_id),
+                "pay_month":    pay_month,
+                "amount_paid":  float(d["amount"]),
+                "payment_type": "expense",
+                "paid_at":      d["expense_date"],
+                "paid_by":      d.get("recorded_by"),
+                "notes":        f"{d['category']} · {d['description']} (via Daily Expenses)",
+                "source":       "daily_expense",
+            })
+
+        payments.sort(key=lambda p: str(p.get("paid_at") or ""))
         return jsonify({"payments": payments, "total": len(payments)})
     finally:
         cur.close(); conn.close()
