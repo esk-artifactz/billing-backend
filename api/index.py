@@ -1072,6 +1072,32 @@ def delete_category(category_id: int):
 # Product routes (any logged-in user)
 # ---------------------------------------------------------------------------
 
+@app.get("/menu")
+@app.get("/api/menu")
+def public_menu():
+    """Public menu card — no auth required. Exposes only customer-safe fields."""
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        cur.execute("""
+            SELECT id, name FROM categories
+            WHERE COALESCE(active, TRUE) = TRUE
+            ORDER BY name
+        """)
+        categories = [_row_to_dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT id, name, selling_price, category_id, subcategory, unit
+            FROM products
+            WHERE COALESCE(active, TRUE) = TRUE
+            ORDER BY name
+        """)
+        products = [_row_to_dict(r) for r in cur.fetchall()]
+        return jsonify({"categories": categories, "products": products})
+    finally:
+        cur.close(); conn.close()
+
+
 @app.get("/products")
 @app.get("/api/products")
 def list_products():
