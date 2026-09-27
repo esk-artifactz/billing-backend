@@ -66,7 +66,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
-_db_version = 5   # bump this to force re-run migrations on next cold start
+_db_version = 6   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -321,6 +321,9 @@ def ensure_db():
             # Link expenses to employees — salary payments logged as expenses
             # count toward that employee's paid salary in the HR report
             cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS employee_id BIGINT")
+
+            # Paid/Unpaid flag on expenses (default paid — old rows were paid out)
+            cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT TRUE")
 
             # ── employees table ───────────────────────────────────────────────
             cur.execute("""
@@ -668,7 +671,9 @@ def _product_to_dict(row: dict) -> dict:
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, datetime):
-            d[k] = v.isoformat()
+            # Naive TIMESTAMP columns are stored in UTC — mark them so the
+            # frontend parses an absolute instant, not device-local time
+            d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
         elif isinstance(v, date):
             d[k] = v.isoformat()    # DATE columns -> "2025-09-25"
         elif isinstance(v, bool):
@@ -1307,7 +1312,7 @@ def _row_to_dict(row):
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, datetime):
-            d[k] = v.isoformat()
+            d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
         elif isinstance(v, date):
             d[k] = v.isoformat()    # DATE columns -> "2025-09-25"
         elif isinstance(v, bool):
@@ -2254,7 +2259,7 @@ def _emp_to_dict(row: dict) -> dict:
     d = dict(row)
     for k, v in d.items():
         if isinstance(v, datetime):
-            d[k] = v.isoformat()
+            d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
         elif hasattr(v, 'isoformat'):       # date objects
             d[k] = v.isoformat()
         elif isinstance(v, bool):
@@ -2490,7 +2495,7 @@ def get_attendance():
             d = dict(r)
             for k, v in d.items():
                 if isinstance(v, datetime):
-                    d[k] = v.isoformat()
+                    d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
                 elif hasattr(v, 'isoformat'):
                     d[k] = v.isoformat()
             rows.append(d)
@@ -2740,6 +2745,72 @@ def list_salary_payments():
 
 
 # ---------------------------------------------------------------------------
+# Salary Payment — UPDATE / DELETE  — Admin only
+# ---------------------------------------------------------------------------
+
+@app.put("/salary/payments/<int:sp_id>")
+@app.put("/api/salary/payments/<int:sp_id>")
+def update_salary_payment(sp_id: int):
+    _a, err_resp = require_admin()
+    if err_resp:
+        return err_resp
+
+    body        = request.get_json(silent=True) or {}
+    amount_paid = body.get("amount_paid")
+    notes       = body.get("notes")
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        fields, vals = [], []
+        if amount_paid is not None:
+            if float(amount_paid) <= 0:
+                return jsonify({"detail": "amount_paid must be > 0"}), 400
+            fields.append("amount_paid = %s"); vals.append(float(amount_paid))
+        if notes is not None:
+            fields.append("notes = %s"); vals.append((notes or "").strip() or None)
+        if not fields:
+            return jsonify({"detail": "Nothing to update"}), 400
+        vals.append(sp_id)
+        cur.execute(f"UPDATE salary_payments SET {', '.join(fields)} WHERE id = %s RETURNING *", vals)
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"detail": "Payment not found"}), 404
+        sp = _emp_to_dict(row)
+        conn.commit()
+        return jsonify({"message": "Payment updated", "salary_payment": sp})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
+    finally:
+        cur.close(); conn.close()
+
+
+@app.delete("/salary/payments/<int:sp_id>")
+@app.delete("/api/salary/payments/<int:sp_id>")
+def delete_salary_payment(sp_id: int):
+    _a, err_resp = require_admin()
+    if err_resp:
+        return err_resp
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        cur.execute("DELETE FROM salary_payments WHERE id = %s RETURNING id", (sp_id,))
+        if not cur.fetchone():
+            return jsonify({"detail": "Payment not found"}), 404
+        conn.commit()
+        return jsonify({"message": "Payment deleted"})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
+    finally:
+        cur.close(); conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Advances — GIVE ADVANCE  (POST /api/advances)   — Admin only
 # ---------------------------------------------------------------------------
 
@@ -2820,6 +2891,75 @@ def list_advances():
             )
         advances = [_emp_to_dict(r) for r in cur.fetchall()]
         return jsonify({"advances": advances, "total": len(advances)})
+    finally:
+        cur.close(); conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Advances — UPDATE / DELETE  — Admin only
+# ---------------------------------------------------------------------------
+
+@app.put("/advances/<int:adv_id>")
+@app.put("/api/advances/<int:adv_id>")
+def update_advance(adv_id: int):
+    _a, err_resp = require_admin()
+    if err_resp:
+        return err_resp
+
+    body     = request.get_json(silent=True) or {}
+    amount   = body.get("amount")
+    given_on = body.get("given_on")
+    notes    = body.get("notes")
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        fields, vals = [], []
+        if amount is not None:
+            if float(amount) <= 0:
+                return jsonify({"detail": "amount must be > 0"}), 400
+            fields.append("amount = %s"); vals.append(float(amount))
+        if given_on:
+            fields.append("given_on = %s::DATE"); vals.append(given_on)
+        if notes is not None:
+            fields.append("notes = %s"); vals.append((notes or "").strip() or None)
+        if not fields:
+            return jsonify({"detail": "Nothing to update"}), 400
+        vals.append(adv_id)
+        cur.execute(f"UPDATE advances SET {', '.join(fields)} WHERE id = %s RETURNING *", vals)
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"detail": "Advance not found"}), 404
+        adv = _emp_to_dict(row)
+        conn.commit()
+        return jsonify({"message": "Advance updated", "advance": adv})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
+    finally:
+        cur.close(); conn.close()
+
+
+@app.delete("/advances/<int:adv_id>")
+@app.delete("/api/advances/<int:adv_id>")
+def delete_advance(adv_id: int):
+    _a, err_resp = require_admin()
+    if err_resp:
+        return err_resp
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        cur.execute("DELETE FROM advances WHERE id = %s RETURNING id", (adv_id,))
+        if not cur.fetchone():
+            return jsonify({"detail": "Advance not found"}), 404
+        conn.commit()
+        return jsonify({"message": "Advance deleted"})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"detail": str(e)}), 400
     finally:
         cur.close(); conn.close()
 
@@ -3307,7 +3447,7 @@ def _expense_to_dict(r):
     d = dict(r)
     for k, v in d.items():
         if isinstance(v, datetime):
-            d[k] = v.isoformat()
+            d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
         elif hasattr(v, 'isoformat'):   # date
             d[k] = v.isoformat()
     return d
@@ -3389,11 +3529,35 @@ def list_daily_expenses():
         advances = [_expense_to_dict(r) for r in cur.fetchall()]
         advance_total = round(sum(float(a["amount"] or 0) for a in advances), 2)
 
+        # Salary payouts (HR "Pay" button) in the same date window — paid_at is
+        # a UTC timestamp, so compare its IST calendar date
+        pay_where, pay_vals = ["1=1"], []
+        pay_date = "((sp.paid_at AT TIME ZONE 'Asia/Kolkata')::DATE)"
+        if date_filter:
+            pay_where.append(f"{pay_date} = %s"); pay_vals.append(date_filter)
+        elif date_from or date_to:
+            if date_from: pay_where.append(f"{pay_date} >= %s"); pay_vals.append(date_from)
+            if date_to:   pay_where.append(f"{pay_date} <= %s"); pay_vals.append(date_to)
+        cur.execute(
+            f"""
+            SELECT sp.id, sp.amount_paid AS amount, sp.notes, sp.pay_month,
+                   sp.paid_by AS recorded_by, sp.paid_at, sp.employee_id, e.full_name
+            FROM salary_payments sp JOIN employees e ON e.id = sp.employee_id
+            WHERE {' AND '.join(pay_where)}
+            ORDER BY sp.paid_at DESC
+            """,
+            pay_vals
+        )
+        payouts = [_expense_to_dict(r) for r in cur.fetchall()]
+        payout_total = round(sum(float(p["amount"] or 0) for p in payouts), 2)
+
         return jsonify({
             "expenses":      expenses,
             "total":         total,
             "advances":      advances,
             "advance_total": advance_total,
+            "payouts":       payouts,
+            "payout_total":  payout_total,
             "categories":    categories,
             "suppliers":     suppliers,
         })
@@ -3418,6 +3582,7 @@ def create_daily_expense():
     notes        = (body.get("notes") or "").strip() or None
     expense_date = (body.get("expense_date") or "").strip() or None
     employee_id  = body.get("employee_id") or None   # set for salary/wage payments
+    is_paid      = bool(body.get("is_paid", True))   # False → payable/pending
 
     if not category:
         return jsonify({"detail": "Category is required"}), 400
@@ -3434,12 +3599,12 @@ def create_daily_expense():
         cur.execute(
             """
             INSERT INTO daily_expenses
-              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id)
-            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s)
+              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id, is_paid)
+            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (expense_date, category, description, float(amount),
-             payment_mode, paid_to, notes, caller.get("username", "unknown"), employee_id)
+             payment_mode, paid_to, notes, caller.get("username", "unknown"), employee_id, is_paid)
         )
         expense = _expense_to_dict(cur.fetchone())
         conn.commit()
@@ -3479,6 +3644,8 @@ def update_daily_expense(exp_id: int):
             fields.append("amount = %s"); vals.append(float(body["amount"]))
         if "employee_id" in body:
             fields.append("employee_id = %s"); vals.append(body["employee_id"] or None)
+        if "is_paid" in body:
+            fields.append("is_paid = %s"); vals.append(bool(body["is_paid"]))
         if not fields:
             return jsonify({"detail": "No fields to update"}), 400
         fields.append("updated_at = NOW()")
