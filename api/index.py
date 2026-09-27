@@ -1169,8 +1169,8 @@ def create_product():
             """,
             (name, barcode or None, brand or None, category_id, subcategory or None, unit,
              purchase_price, mrp, selling_price, gst_percentage, track_stock,
-             current_stock if track_stock else None,
-             minimum_stock_level if track_stock else None,
+             current_stock if track_stock else 0,
+             minimum_stock_level if track_stock else 0,
              quick_sale_enabled, active,
              supplier_id, mfg_date, expiry_date, fssai_no),
         )
