@@ -66,7 +66,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
-_db_version = 4   # bump this to force re-run migrations on next cold start
+_db_version = 5   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -317,6 +317,10 @@ def ensure_db():
                 ADD CONSTRAINT fk_held_sale_items_held_sale
                 FOREIGN KEY (held_sale_id) REFERENCES held_sales(id) ON DELETE CASCADE
             """)
+
+            # Link expenses to employees — salary payments logged as expenses
+            # count toward that employee's paid salary in the HR report
+            cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS employee_id BIGINT")
 
             # ── employees table ───────────────────────────────────────────────
             cur.execute("""
@@ -2578,6 +2582,23 @@ def attendance_report():
         )
         paid_map = {row["employee_id"]: float(row["total_paid"]) for row in cur.fetchall()}
 
+        # Salary payments logged via Daily Expenses (employee-linked) — same effect
+        # as /salary/pay, so a Cashier-recorded salary expense reduces balance due
+        exp_paid_map = {}
+        cur.execute(
+            """
+            SELECT employee_id,
+                   COALESCE(SUM(amount), 0) AS exp_paid
+            FROM daily_expenses
+            WHERE employee_id IS NOT NULL
+              AND TO_CHAR(expense_date, 'YYYY-MM') = %s
+            GROUP BY employee_id
+            """,
+            (month,),
+        )
+        for r in cur.fetchall():
+            exp_paid_map[r["employee_id"]] = float(r["exp_paid"])
+
         # Total advances given this month (not yet recovered)
         cur.execute(
             """
@@ -2595,11 +2616,13 @@ def attendance_report():
         for row in report:
             eid        = row["employee_id"]
             paid       = paid_map.get(eid, 0)
+            exp_paid   = exp_paid_map.get(eid, 0)   # salary paid via Daily Expenses
             adv        = advance_map.get(eid, 0)
-            balance    = round(row["gross_earned"] - paid - adv, 2)
-            row["total_paid"]     = paid
-            row["total_advance"]  = adv
-            row["balance_due"]    = balance
+            balance    = round(row["gross_earned"] - paid - exp_paid - adv, 2)
+            row["total_paid"]         = round(paid + exp_paid, 2)
+            row["paid_via_expenses"]  = exp_paid
+            row["total_advance"]      = adv
+            row["balance_due"]        = balance
 
         return jsonify({"report": report, "month": month})
     finally:
@@ -3319,11 +3342,33 @@ def list_daily_expenses():
         )
         suppliers = [{"id": r["id"], "name": r["name"], "phone": r["phone"]} for r in cur.fetchall()]
 
+        # Salary advances in the same date window — shown as read-only rows
+        adv_where, adv_vals = ["1=1"], []
+        if date_filter:
+            adv_where.append("a.given_on = %s"); adv_vals.append(date_filter)
+        elif date_from or date_to:
+            if date_from: adv_where.append("a.given_on >= %s"); adv_vals.append(date_from)
+            if date_to:   adv_where.append("a.given_on <= %s"); adv_vals.append(date_to)
+        cur.execute(
+            f"""
+            SELECT a.id, a.given_on AS expense_date, a.amount, a.notes,
+                   a.given_by AS recorded_by, a.employee_id, e.full_name
+            FROM advances a JOIN employees e ON e.id = a.employee_id
+            WHERE {' AND '.join(adv_where)}
+            ORDER BY a.given_on DESC, a.id DESC
+            """,
+            adv_vals
+        )
+        advances = [_expense_to_dict(r) for r in cur.fetchall()]
+        advance_total = round(sum(float(a["amount"] or 0) for a in advances), 2)
+
         return jsonify({
-            "expenses":   expenses,
-            "total":      total,
-            "categories": categories,
-            "suppliers":  suppliers,
+            "expenses":      expenses,
+            "total":         total,
+            "advances":      advances,
+            "advance_total": advance_total,
+            "categories":    categories,
+            "suppliers":     suppliers,
         })
     finally:
         cur.close(); conn.close()
@@ -3345,6 +3390,7 @@ def create_daily_expense():
     paid_to      = (body.get("paid_to") or "").strip() or None
     notes        = (body.get("notes") or "").strip() or None
     expense_date = (body.get("expense_date") or "").strip() or None
+    employee_id  = body.get("employee_id") or None   # set for salary/wage payments
 
     if not category:
         return jsonify({"detail": "Category is required"}), 400
@@ -3361,12 +3407,12 @@ def create_daily_expense():
         cur.execute(
             """
             INSERT INTO daily_expenses
-              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by)
-            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s)
+              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id)
+            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (expense_date, category, description, float(amount),
-             payment_mode, paid_to, notes, caller.get("username", "unknown"))
+             payment_mode, paid_to, notes, caller.get("username", "unknown"), employee_id)
         )
         expense = _expense_to_dict(cur.fetchone())
         conn.commit()
@@ -3404,6 +3450,8 @@ def update_daily_expense(exp_id: int):
                     vals.append((val or "").strip() if isinstance(val, str) else val)
         if "amount" in body:
             fields.append("amount = %s"); vals.append(float(body["amount"]))
+        if "employee_id" in body:
+            fields.append("employee_id = %s"); vals.append(body["employee_id"] or None)
         if not fields:
             return jsonify({"detail": "No fields to update"}), 400
         fields.append("updated_at = NOW()")
