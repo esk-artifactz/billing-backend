@@ -66,7 +66,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
-_db_version = 6   # bump this to force re-run migrations on next cold start
+_db_version = 7   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -324,6 +324,9 @@ def ensure_db():
 
             # Paid/Unpaid flag on expenses (default paid — old rows were paid out)
             cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT TRUE")
+
+            # Parcel charge on sales — optional extra added to grand_total
+            cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS parcel_charge NUMERIC(12,2) NOT NULL DEFAULT 0")
 
             # ── employees table ───────────────────────────────────────────────
             cur.execute("""
@@ -1362,6 +1365,7 @@ def checkout():
     body = request.get_json(silent=True) or {}
     items            = body.get("items", [])
     discount_total   = float(body.get("discount_total", 0))
+    parcel_charge    = float(body.get("parcel_charge") or 0)
     payment_method   = (body.get("payment_method") or "cash").strip()
     amount_tendered  = body.get("amount_tendered")
     customer_name    = (body.get("customer_name") or "").strip() or None
@@ -1407,7 +1411,7 @@ def checkout():
                 "current_stock":   product.get("current_stock"),
             })
 
-        grand_before_round = subtotal - discount_total + tax_total
+        grand_before_round = subtotal - discount_total + tax_total + parcel_charge
         grand_total        = round(grand_before_round)
         round_off          = round(grand_total - grand_before_round, 2)
         change_amount      = round(float(amount_tendered or grand_total) - grand_total, 2) if amount_tendered else 0.0
@@ -1418,13 +1422,13 @@ def checkout():
         cur.execute(
             """
             INSERT INTO sales (invoice_number, cashier_username, sale_time, subtotal, discount_total, tax_total,
-                               round_off, grand_total, payment_method, amount_tendered, change_amount,
+                               parcel_charge, round_off, grand_total, payment_method, amount_tendered, change_amount,
                                customer_name, customer_mobile, status)
-            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
             RETURNING *
             """,
             (invoice_number, cashier_username, round(subtotal, 2), round(discount_total, 2),
-             round(tax_total, 2), round_off, grand_total, payment_method,
+             round(tax_total, 2), round(parcel_charge, 2), round_off, grand_total, payment_method,
              float(amount_tendered) if amount_tendered else None, change_amount,
              customer_name, customer_mobile),
         )
@@ -4106,9 +4110,20 @@ def expense_report():
 
         w = " AND ".join(where)
 
-        # Grand total
+        # Grand total & unpaid total
         cur.execute(f"SELECT COALESCE(SUM(amount),0) AS total FROM daily_expenses WHERE {w}", vals)
         grand_total = float(cur.fetchone()["total"])
+
+        cur.execute(f"SELECT COALESCE(SUM(amount),0) AS total FROM daily_expenses WHERE {w} AND is_paid = FALSE", vals)
+        unpaid_total = float(cur.fetchone()["total"])
+
+        # Unpaid items detail
+        cur.execute(f"""
+            SELECT * FROM daily_expenses
+            WHERE {w} AND is_paid = FALSE
+            ORDER BY expense_date ASC, created_at ASC
+        """, vals)
+        unpaid_items = [_expense_to_dict(r) for r in cur.fetchall()]
 
         # By category (with color from expense_categories)
         cur.execute(f"""
@@ -4189,12 +4204,14 @@ def expense_report():
         recent = [_expense_to_dict(r) for r in cur.fetchall()]
 
         return jsonify({
-            "grand_total": grand_total,
-            "by_category": by_category,
-            "by_supplier": by_supplier,
-            "by_mode":     by_mode,
-            "daily_trend": daily_trend,
-            "recent":      recent,
+            "grand_total":  grand_total,
+            "unpaid_total": unpaid_total,
+            "unpaid_items": unpaid_items,
+            "by_category":  by_category,
+            "by_supplier":  by_supplier,
+            "by_mode":      by_mode,
+            "daily_trend":  daily_trend,
+            "recent":       recent,
             "filters": {
                 "from": date_from, "to": date_to,
                 "category": cat_filter, "payment_mode": mode_filter,
