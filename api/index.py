@@ -2120,6 +2120,96 @@ def delete_credit_bill(bill_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Stock Valuation — value of current inventory at purchase price & MRP
+# GET /api/stock-valuation?category=&search=&track_only=true
+# ---------------------------------------------------------------------------
+
+@app.get("/stock-valuation")
+@app.get("/api/stock-valuation")
+def stock_valuation():
+    _p, err_resp = require_auth()
+    if err_resp:
+        return err_resp
+
+    cat_filter  = request.args.get("category", "").strip()
+    search      = request.args.get("search", "").strip()
+    track_only  = request.args.get("track_only", "true").lower() == "true"
+
+    ensure_db()
+    conn = get_conn(); cur = get_cur(conn)
+    try:
+        where, vals = ["p.active = TRUE"], []
+        if track_only:
+            where.append("p.track_stock = TRUE")
+        if cat_filter and cat_filter != "all":
+            where.append("c.name = %s"); vals.append(cat_filter)
+        if search:
+            where.append("(LOWER(p.name) LIKE %s OR LOWER(p.brand) LIKE %s)")
+            vals += [f"%{search.lower()}%", f"%{search.lower()}%"]
+
+        w = " AND ".join(where)
+        cur.execute(f"""
+            SELECT
+                p.id, p.name, p.brand, p.unit,
+                p.purchase_price, p.mrp, p.selling_price,
+                p.current_stock,
+                p.minimum_stock_level,
+                p.track_stock,
+                c.name AS category_name,
+                COALESCE(p.current_stock, 0) * p.purchase_price  AS purchase_value,
+                COALESCE(p.current_stock, 0) * p.mrp             AS mrp_value,
+                COALESCE(p.current_stock, 0) * p.selling_price    AS selling_value
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE {w}
+            ORDER BY c.name, p.name
+        """, vals)
+        rows = cur.fetchall()
+        products = []
+        for r in rows:
+            d = dict(r)
+            for k, v in d.items():
+                if isinstance(v, Decimal): d[k] = float(v)
+                elif isinstance(v, bool):  d[k] = bool(v)
+            products.append(d)
+
+        # Aggregates
+        total_purchase_value = sum(p["purchase_value"] for p in products)
+        total_mrp_value      = sum(p["mrp_value"]      for p in products)
+        total_selling_value  = sum(p["selling_value"]  for p in products)
+        potential_profit     = total_selling_value - total_purchase_value
+
+        # By-category summary
+        cat_map = {}
+        for p in products:
+            cn = p["category_name"] or "Uncategorised"
+            if cn not in cat_map:
+                cat_map[cn] = {"category": cn, "count": 0,
+                               "purchase_value": 0, "mrp_value": 0, "selling_value": 0}
+            cat_map[cn]["count"]          += 1
+            cat_map[cn]["purchase_value"] += p["purchase_value"]
+            cat_map[cn]["mrp_value"]      += p["mrp_value"]
+            cat_map[cn]["selling_value"]  += p["selling_value"]
+        category_summary = sorted(cat_map.values(), key=lambda x: -x["purchase_value"])
+
+        # Distinct categories for filter dropdown
+        cur.execute("SELECT DISTINCT name FROM categories ORDER BY name")
+        categories = [r["name"] for r in cur.fetchall()]
+
+        return jsonify({
+            "products":            products,
+            "total_purchase_value": total_purchase_value,
+            "total_mrp_value":      total_mrp_value,
+            "total_selling_value":  total_selling_value,
+            "potential_profit":     potential_profit,
+            "category_summary":    category_summary,
+            "categories":          categories,
+            "count":               len(products),
+        })
+    finally:
+        cur.close(); conn.close()
+
+
 # Stock Alerts — low stock items  (GET /api/stock/alerts)
 # ---------------------------------------------------------------------------
 
@@ -4160,17 +4250,25 @@ def expense_report():
 
         w = " AND ".join(where)
 
-        # Grand total & unpaid total
+        # Grand total & unpaid/remaining total
         cur.execute(f"SELECT COALESCE(SUM(amount),0) AS total FROM daily_expenses WHERE {w}", vals)
         grand_total = float(cur.fetchone()["total"])
 
-        cur.execute(f"SELECT COALESCE(SUM(amount),0) AS total FROM daily_expenses WHERE {w} AND is_paid = FALSE", vals)
-        unpaid_total = float(cur.fetchone()["total"])
+        # Unpaid = sum of (amount - paid_amount) for rows where remaining > 0
+        # COALESCE(paid_amount, amount) handles legacy rows that pre-date the paid_amount column
+        cur.execute(f"""
+            SELECT COALESCE(SUM(amount - COALESCE(paid_amount, amount)), 0) AS remaining_total
+            FROM daily_expenses
+            WHERE {w}
+              AND amount > COALESCE(paid_amount, amount)
+        """, vals)
+        unpaid_total = float(cur.fetchone()["remaining_total"])
 
-        # Unpaid items detail
+        # Unpaid items — any row with remaining balance (fully unpaid OR partial)
         cur.execute(f"""
             SELECT * FROM daily_expenses
-            WHERE {w} AND is_paid = FALSE
+            WHERE {w}
+              AND amount > COALESCE(paid_amount, amount)
             ORDER BY expense_date ASC, created_at ASC
         """, vals)
         unpaid_items = [_expense_to_dict(r) for r in cur.fetchall()]
