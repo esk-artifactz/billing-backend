@@ -66,7 +66,7 @@ def get_cur(conn):
 # ---------------------------------------------------------------------------
 
 _db_ready = False
-_db_version = 7   # bump this to force re-run migrations on next cold start
+_db_version = 8   # bump this to force re-run migrations on next cold start
 
 
 def ensure_db():
@@ -327,6 +327,17 @@ def ensure_db():
 
             # Parcel charge on sales — optional extra added to grand_total
             cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS parcel_charge NUMERIC(12,2) NOT NULL DEFAULT 0")
+
+            # Partial payment support on expenses:
+            # paid_amount = how much has actually been paid (0 → fully unpaid, = amount → fully paid)
+            # is_paid is now computed from paid_amount >= amount; kept as a column for backward compat
+            cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2)")
+            # Back-fill: existing rows with is_paid=TRUE get paid_amount = amount; FALSE gets 0
+            cur.execute("""
+                UPDATE daily_expenses
+                SET paid_amount = CASE WHEN is_paid THEN amount ELSE 0 END
+                WHERE paid_amount IS NULL
+            """)
 
             # ── employees table ───────────────────────────────────────────────
             cur.execute("""
@@ -3464,6 +3475,18 @@ def _expense_to_dict(r):
             d[k] = (v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v).isoformat()
         elif hasattr(v, 'isoformat'):   # date
             d[k] = v.isoformat()
+    # Normalise paid_amount — may be NULL for very old rows
+    amount      = float(d.get("amount") or 0)
+    paid_amount = d.get("paid_amount")
+    if paid_amount is None:
+        # Infer from is_paid flag for legacy rows
+        paid_amount = amount if d.get("is_paid", True) else 0.0
+    else:
+        paid_amount = float(paid_amount)
+    d["paid_amount"]      = paid_amount
+    d["remaining_amount"] = round(max(amount - paid_amount, 0), 2)
+    # Keep is_paid in sync with actual payments
+    d["is_paid"] = paid_amount >= amount
     return d
 
 EXPENSE_CATEGORIES = [
@@ -3596,16 +3619,26 @@ def create_daily_expense():
     notes        = (body.get("notes") or "").strip() or None
     expense_date = (body.get("expense_date") or "").strip() or None
     employee_id  = body.get("employee_id") or None   # set for salary/wage payments
-    is_paid      = bool(body.get("is_paid", True))   # False → payable/pending
+    amt          = float(amount) if amount is not None else None
+
+    # paid_amount: explicit value OR derive from is_paid flag (backward compat)
+    paid_amount_raw = body.get("paid_amount")
+    if paid_amount_raw is not None:
+        paid_amount = max(0.0, min(float(paid_amount_raw), amt or 0))
+    else:
+        is_paid_flag = bool(body.get("is_paid", True))
+        paid_amount  = amt if is_paid_flag else 0.0
 
     if not category:
         return jsonify({"detail": "Category is required"}), 400
     if not description:
         return jsonify({"detail": "Description is required"}), 400
-    if amount is None or float(amount) <= 0:
+    if amt is None or amt <= 0:
         return jsonify({"detail": "Amount must be greater than 0"}), 400
     if payment_mode not in ("cash", "bank", "upi"):
         return jsonify({"detail": "Payment mode must be cash, bank or upi"}), 400
+
+    is_paid = (paid_amount >= amt)
 
     ensure_db()
     conn = get_conn(); cur = get_cur(conn)
@@ -3613,12 +3646,12 @@ def create_daily_expense():
         cur.execute(
             """
             INSERT INTO daily_expenses
-              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id, is_paid)
-            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+              (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id, is_paid, paid_amount)
+            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
-            (expense_date, category, description, float(amount),
-             payment_mode, paid_to, notes, caller.get("username", "unknown"), employee_id, is_paid)
+            (expense_date, category, description, amt,
+             payment_mode, paid_to, notes, caller.get("username", "unknown"), employee_id, is_paid, paid_amount)
         )
         expense = _expense_to_dict(cur.fetchone())
         conn.commit()
@@ -3658,8 +3691,15 @@ def update_daily_expense(exp_id: int):
             fields.append("amount = %s"); vals.append(float(body["amount"]))
         if "employee_id" in body:
             fields.append("employee_id = %s"); vals.append(body["employee_id"] or None)
-        if "is_paid" in body:
-            fields.append("is_paid = %s"); vals.append(bool(body["is_paid"]))
+        # paid_amount / is_paid — support both; paid_amount takes precedence
+        if "paid_amount" in body:
+            pa = float(body["paid_amount"])
+            fields.append("paid_amount = %s"); vals.append(pa)
+            fields.append("is_paid = (COALESCE(%s, paid_amount) >= amount)"); vals.append(pa)
+        elif "is_paid" in body:
+            flag = bool(body["is_paid"])
+            fields.append("is_paid = %s"); vals.append(flag)
+            fields.append("paid_amount = CASE WHEN %s THEN amount ELSE 0 END"); vals.append(flag)
         if not fields:
             return jsonify({"detail": "No fields to update"}), 400
         fields.append("updated_at = NOW()")
