@@ -2438,6 +2438,16 @@ def mark_attendance():
         if not cur.fetchone():
             return jsonify({"detail": "Employee not found or inactive"}), 404
 
+        # Non-Admins cannot override an already-marked attendance record
+        caller_role = payload.get("role", "")
+        if caller_role != "Admin":
+            cur.execute(
+                "SELECT id FROM attendance WHERE employee_id = %s AND att_date = %s::DATE",
+                (employee_id, att_date),
+            )
+            if cur.fetchone():
+                return jsonify({"detail": "Attendance already marked. Only Admin can override."}), 403
+
         cur.execute(
             """
             INSERT INTO attendance (employee_id, att_date, status, marked_by, notes)
