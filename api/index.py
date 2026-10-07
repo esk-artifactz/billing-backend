@@ -488,7 +488,7 @@ def ensure_db():
             """)
             # Seed default designations if table is empty
             cur.execute("SELECT COUNT(*) FROM designations")
-            if cur.fetchone()[0] == 0:
+            if cur.fetchone()["count"] == 0:
                 cur.execute("""
                     INSERT INTO designations (name, daily_rate, ot_rate) VALUES
                         ('Tea Master',          800, 100),
@@ -673,7 +673,7 @@ def ensure_db():
                 )
             """)
             cur.execute("SELECT COUNT(*) FROM contact_categories")
-            if cur.fetchone()[0] == 0:
+            if cur.fetchone()["count"] == 0:
                 cat_defaults = [
                     ("Gas Agency",          "#f97316", "🔥"),
                     ("Ice Cream Vendor",    "#06b6d4", "🍦"),
@@ -727,7 +727,7 @@ def ensure_db():
             """)
             # Seed default categories if table is empty
             cur.execute("SELECT COUNT(*) FROM expense_categories")
-            if cur.fetchone()[0] == 0:
+            if cur.fetchone()["count"] == 0:
                 defaults = [
                     ("Supplier Payment",       "Payments made to suppliers / vendors",             "#d97706", 1),
                     ("Vegetables & Produce",   "Fresh vegetables, fruits and produce",              "#16a34a", 2),
@@ -2671,7 +2671,7 @@ def delete_designation(did: int):
     try:
         # Don't hard-delete if linked to employees or attendance; just deactivate
         cur.execute("SELECT COUNT(*) FROM employees WHERE default_designation_id = %s", (did,))
-        if cur.fetchone()[0] > 0:
+        if cur.fetchone()["count"] > 0:
             cur.execute("UPDATE designations SET active = FALSE, updated_at = NOW() WHERE id = %s RETURNING *", (did,))
             conn.commit()
             return jsonify({"message": "Designation deactivated (still referenced by employees)", "designation": _desig_to_dict(cur.fetchone())})
@@ -2751,7 +2751,7 @@ def create_employee():
         # Resolve daily_rate from designation
         cur.execute("SELECT daily_rate FROM designations WHERE id = %s", (default_designation_id,))
         d_row = cur.fetchone()
-        daily_rate = float(d_row[0]) if d_row else 0.0
+        daily_rate = float(d_row["daily_rate"]) if d_row else 0.0
 
         cur.execute(
             """
@@ -2830,7 +2830,7 @@ def update_employee(emp_id: int):
                 cur.execute("SELECT daily_rate FROM designations WHERE id = %s", (did,))
                 dr = cur.fetchone()
                 if dr:
-                    fields.append("daily_rate = %s"); values.append(float(dr[0]))
+                    fields.append("daily_rate = %s"); values.append(float(dr["daily_rate"]))
 
         if not fields:
             return jsonify({"detail": "No fields to update"}), 400
@@ -4439,7 +4439,7 @@ def _gen_return_number(cur, prefix):
     table = 'sales_returns' if prefix == 'SR' else 'purchase_returns'
     col   = 'return_number'
     cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} LIKE %s", (f'{prefix}-{today_str}-%',))
-    count = cur.fetchone()[0]
+    count = cur.fetchone()["count"]
     return f'{prefix}-{today_str}-{count + 1:04d}'
 
 
@@ -4540,7 +4540,7 @@ def create_sales_return():
             principal.get('username', ''),
             body.get('notes', '').strip(),
         ))
-        ret_id = cur.fetchone()[0]
+        ret_id = cur.fetchone()["id"]
 
         for item in items_body:
             pid       = item.get('product_id')
@@ -4743,7 +4743,7 @@ def create_purchase_return():
             principal.get('username', ''),
             body.get('notes', '').strip(),
         ))
-        ret_id = cur.fetchone()[0]
+        ret_id = cur.fetchone()["id"]
 
         for item in items_body:
             pid      = item.get('product_id')
