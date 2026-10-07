@@ -488,7 +488,7 @@ def ensure_db():
             """)
             # Seed default designations if table is empty
             cur.execute("SELECT COUNT(*) FROM designations")
-            if cur.fetchone()["count"] == 0:
+            if cur.fetchone()[0] == 0:
                 cur.execute("""
                     INSERT INTO designations (name, daily_rate, ot_rate) VALUES
                         ('Tea Master',          800, 100),
@@ -673,7 +673,7 @@ def ensure_db():
                 )
             """)
             cur.execute("SELECT COUNT(*) FROM contact_categories")
-            if cur.fetchone()["count"] == 0:
+            if cur.fetchone()[0] == 0:
                 cat_defaults = [
                     ("Gas Agency",          "#f97316", "🔥"),
                     ("Ice Cream Vendor",    "#06b6d4", "🍦"),
@@ -727,7 +727,7 @@ def ensure_db():
             """)
             # Seed default categories if table is empty
             cur.execute("SELECT COUNT(*) FROM expense_categories")
-            if cur.fetchone()["count"] == 0:
+            if cur.fetchone()[0] == 0:
                 defaults = [
                     ("Supplier Payment",       "Payments made to suppliers / vendors",             "#d97706", 1),
                     ("Vegetables & Produce",   "Fresh vegetables, fruits and produce",              "#16a34a", 2),
