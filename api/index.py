@@ -3270,7 +3270,72 @@ def attendance_detail():
                 "total_pay":         round(day_pay + ot_pay, 2),
                 "marked_by":         r["marked_by"] or "",
             })
-        return jsonify({"days": rows, "month": month})
+        # ── Salary payments this month ─────────────────────────────────────
+        cur.execute("""
+            SELECT id, paid_at, amount_paid, notes, source
+            FROM salary_payments
+            WHERE employee_id = %s AND pay_month = %s
+            ORDER BY paid_at
+        """, (employee_id, month))
+        payments = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["amount_paid"] = float(d["amount_paid"])
+            if isinstance(d.get("paid_at"), datetime):
+                d["paid_at"] = d["paid_at"].isoformat()
+            payments.append(d)
+
+        # Salary paid via Daily Expenses for this employee this month
+        cur.execute("""
+            SELECT id, expense_date, amount, description, payment_mode
+            FROM daily_expenses
+            WHERE employee_id = %s
+              AND TO_CHAR(expense_date, 'YYYY-MM') = %s
+            ORDER BY expense_date
+        """, (employee_id, month))
+        exp_payments = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["amount"] = float(d["amount"])
+            if hasattr(d.get("expense_date"), "isoformat"):
+                d["expense_date"] = d["expense_date"].isoformat()
+            d["source"] = "daily_expense"
+            exp_payments.append(d)
+
+        # ── Advances this month ────────────────────────────────────────────
+        cur.execute("""
+            SELECT id, given_on, amount, notes, recovered
+            FROM advances
+            WHERE employee_id = %s
+              AND TO_CHAR(given_on, 'YYYY-MM') = %s
+            ORDER BY given_on
+        """, (employee_id, month))
+        advances = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["amount"] = float(d["amount"])
+            if hasattr(d.get("given_on"), "isoformat"):
+                d["given_on"] = d["given_on"].isoformat()
+            advances.append(d)
+
+        total_paid  = sum(p["amount_paid"] for p in payments) + sum(e["amount"] for e in exp_payments)
+        total_adv   = sum(a["amount"] for a in advances if not a["recovered"])
+        gross_earned = sum(d["total_pay"] for d in rows)
+        balance      = round(gross_earned - total_paid - total_adv, 2)
+
+        return jsonify({
+            "days":        rows,
+            "payments":    payments,
+            "exp_payments": exp_payments,
+            "advances":    advances,
+            "summary": {
+                "gross_earned": round(gross_earned, 2),
+                "total_paid":   round(total_paid, 2),
+                "total_advance": round(total_adv, 2),
+                "balance_due":  balance,
+            },
+            "month": month,
+        })
     finally:
         cur.close(); conn.close()
 
