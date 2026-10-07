@@ -3272,7 +3272,7 @@ def attendance_detail():
             })
         # ── Salary payments this month ─────────────────────────────────────
         cur.execute("""
-            SELECT id, paid_at, amount_paid, notes, source
+            SELECT id, paid_at, amount_paid, notes, payment_type
             FROM salary_payments
             WHERE employee_id = %s AND pay_month = %s
             ORDER BY paid_at
@@ -3299,7 +3299,6 @@ def attendance_detail():
             d["amount"] = float(d["amount"])
             if hasattr(d.get("expense_date"), "isoformat"):
                 d["expense_date"] = d["expense_date"].isoformat()
-            d["source"] = "daily_expense"
             exp_payments.append(d)
 
         # ── Advances this month ────────────────────────────────────────────
