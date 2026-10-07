@@ -2738,18 +2738,23 @@ def create_employee():
             INSERT INTO employees
                 (emp_code, full_name, phone, role, daily_rate, join_date, default_designation_id)
             VALUES (%s, %s, %s, %s, %s, COALESCE(%s::DATE, CURRENT_DATE), %s)
-            RETURNING *
+            RETURNING id
             """,
             (emp_code, full_name, phone or None, role, daily_rate, join_date, default_designation_id),
         )
-        emp = _emp_to_dict(cur.fetchone())
-        # Attach designation info
-        cur.execute("SELECT name, daily_rate FROM designations WHERE id = %s", (default_designation_id,))
-        dr = cur.fetchone()
-        if dr:
-            emp['designation_name'] = dr[0]
-            emp['designation_daily_rate'] = float(dr[1])
+        new_id = cur.fetchone()["id"]
         conn.commit()
+
+        # Fetch with designation info joined
+        cur.execute("""
+            SELECT e.*,
+                   d.name       AS designation_name,
+                   d.daily_rate AS designation_daily_rate
+            FROM employees e
+            LEFT JOIN designations d ON d.id = e.default_designation_id
+            WHERE e.id = %s
+        """, (new_id,))
+        emp = _emp_to_dict(cur.fetchone())
         return jsonify({"message": "Employee created", "employee": emp}), 201
     except Exception as e:
         conn.rollback()
@@ -2812,15 +2817,25 @@ def update_employee(emp_id: int):
 
         fields.append("updated_at = NOW()")
         values.append(emp_id)
-        cur.execute(f"UPDATE employees SET {', '.join(fields)} WHERE id = %s RETURNING *", values)
-        emp = _emp_to_dict(cur.fetchone())
-        # Attach designation info
-        if emp.get('default_designation_id'):
-            cur.execute("SELECT name, daily_rate FROM designations WHERE id = %s", (emp['default_designation_id'],))
-            dr = cur.fetchone()
-            if dr:
-                emp['designation_name'] = dr[0]; emp['designation_daily_rate'] = float(dr[1])
+        cur.execute(
+            f"UPDATE employees SET {', '.join(fields)} WHERE id = %s",
+            values,
+        )
         conn.commit()
+
+        # Fetch the updated row with designation info joined
+        cur.execute("""
+            SELECT e.*,
+                   d.name       AS designation_name,
+                   d.daily_rate AS designation_daily_rate
+            FROM employees e
+            LEFT JOIN designations d ON d.id = e.default_designation_id
+            WHERE e.id = %s
+        """, (emp_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"detail": "Employee not found after update"}), 404
+        emp = _emp_to_dict(row)
         return jsonify({"message": "Employee updated", "employee": emp})
     except Exception as e:
         conn.rollback()
