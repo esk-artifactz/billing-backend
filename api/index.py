@@ -3195,6 +3195,87 @@ def attendance_report():
 
 
 # ---------------------------------------------------------------------------
+# Attendance — DAY-BY-DAY DETAIL for one employee + month
+# GET /attendance/detail?employee_id=X&month=YYYY-MM  — Admin only
+# Returns per-day rows: date, status, designation, rate, OT, day pay
+# ---------------------------------------------------------------------------
+
+@app.get("/attendance/detail")
+@app.get("/api/attendance/detail")
+def attendance_detail():
+    admin, err_resp = require_admin()
+    if err_resp:
+        return err_resp
+
+    employee_id = request.args.get("employee_id")
+    month       = request.args.get("month", "")
+    if not employee_id:
+        return jsonify({"detail": "employee_id is required"}), 400
+    try:
+        year, mon = int(month.split("-")[0]), int(month.split("-")[1])
+    except Exception:
+        return jsonify({"detail": "month must be YYYY-MM"}), 400
+
+    ensure_db()
+    conn = get_conn()
+    cur  = get_cur(conn)
+    try:
+        cur.execute("""
+            SELECT
+                a.att_date,
+                a.status,
+                a.designation_id       AS att_designation_id,
+                att_d.name             AS att_designation_name,
+                att_d.daily_rate       AS att_daily_rate,
+                def_d.name             AS default_designation_name,
+                def_d.daily_rate       AS def_daily_rate,
+                e.daily_rate           AS emp_daily_rate,
+                COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) AS day_rate,
+                COALESCE(a.ot_hours, 0) AS ot_hours,
+                COALESCE(a.ot_rate, att_d.ot_rate, def_d.ot_rate, 0)          AS ot_hr_rate,
+                a.marked_by
+            FROM attendance a
+            JOIN employees e   ON e.id = a.employee_id
+            LEFT JOIN designations att_d ON att_d.id = a.designation_id
+            LEFT JOIN designations def_d ON def_d.id = e.default_designation_id
+            WHERE a.employee_id = %s
+              AND EXTRACT(YEAR  FROM a.att_date) = %s
+              AND EXTRACT(MONTH FROM a.att_date) = %s
+            ORDER BY a.att_date
+        """, (employee_id, year, mon))
+
+        rows = []
+        for r in cur.fetchall():
+            day_rate  = float(r["day_rate"] or 0)
+            ot_hours  = float(r["ot_hours"] or 0)
+            ot_rate   = float(r["ot_hr_rate"] or 0)
+            st        = r["status"]
+            if st == "present":
+                day_pay = day_rate
+            elif st == "half_day":
+                day_pay = day_rate * 0.5
+            else:                    # absent, leave — no base pay
+                day_pay = 0.0
+            ot_pay    = round(ot_hours * ot_rate, 2)
+            rows.append({
+                "date":              r["att_date"].isoformat(),
+                "status":            st,
+                "designation":       r["att_designation_name"] or r["default_designation_name"] or "—",
+                "is_override":       bool(r["att_designation_id"]),
+                "daily_rate":        day_rate,
+                "ot_hours":          ot_hours,
+                "ot_rate":           ot_rate,
+                "ot_pay":            ot_pay,
+                "day_pay":           round(day_pay, 2),
+                "total_pay":         round(day_pay + ot_pay, 2),
+                "marked_by":         r["marked_by"] or "",
+            })
+        return jsonify({"days": rows, "month": month})
+    finally:
+        cur.close(); conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Salary Payment — ADD PAYOUT  (POST /api/salary/pay)   — Admin only
 # Multiple payouts per month allowed (weekly / fortnightly / ad-hoc)
 # ---------------------------------------------------------------------------
