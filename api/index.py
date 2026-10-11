@@ -4439,14 +4439,14 @@ def get_expense_payments(exp_id: int):
         rows = cur.fetchall()
         payments = [
             {
-                "id":           r[0],
-                "expense_id":   r[1],
-                "paid_on":      r[2].isoformat() if r[2] else None,
-                "amount":       float(r[3]),
-                "payment_mode": r[4],
-                "note":         r[5] or "",
-                "recorded_by":  r[6] or "",
-                "created_at":   r[7].isoformat() if r[7] else None,
+                "id":           r["id"],
+                "expense_id":   r["expense_id"],
+                "paid_on":      r["paid_on"].isoformat() if r["paid_on"] else None,
+                "amount":       float(r["amount"]),
+                "payment_mode": r["payment_mode"],
+                "note":         r["note"] or "",
+                "recorded_by":  r["recorded_by"] or "",
+                "created_at":   r["created_at"].isoformat() if r["created_at"] else None,
             }
             for r in rows
         ]
@@ -4472,8 +4472,8 @@ def add_expense_payment(exp_id: int):
         row = cur.fetchone()
         if not row:
             return jsonify({"detail": "Expense not found"}), 404
-        total_amount = float(row[0])
-        current_paid = float(row[1] or 0)
+        total_amount = float(row["amount"])
+        current_paid = float(row["paid_amount"] or 0)
         remaining    = round(max(total_amount - current_paid, 0), 2)
 
         body = request.get_json(silent=True) or {}
@@ -4498,14 +4498,14 @@ def add_expense_payment(exp_id: int):
         """, (exp_id, paid_on, amt, payment_mode, note, recorded_by))
         prow = cur.fetchone()
         payment = {
-            "id":           prow[0],
-            "expense_id":   prow[1],
-            "paid_on":      prow[2].isoformat() if prow[2] else None,
-            "amount":       float(prow[3]),
-            "payment_mode": prow[4],
-            "note":         prow[5] or "",
-            "recorded_by":  prow[6] or "",
-            "created_at":   prow[7].isoformat() if prow[7] else None,
+            "id":           prow["id"],
+            "expense_id":   prow["expense_id"],
+            "paid_on":      prow["paid_on"].isoformat() if prow["paid_on"] else None,
+            "amount":       float(prow["amount"]),
+            "payment_mode": prow["payment_mode"],
+            "note":         prow["note"] or "",
+            "recorded_by":  prow["recorded_by"] or "",
+            "created_at":   prow["created_at"].isoformat() if prow["created_at"] else None,
         }
         # Recalculate paid_amount on the expense from the instalment sum
         expense = _recalc_paid_amount(cur, exp_id)
@@ -4675,9 +4675,9 @@ def create_sales_return():
         """, (
             return_number,
             sale_id,
-            invoice_number or sale_row[1],
-            body.get('customer_name') or sale_row[2] or '',
-            body.get('customer_mobile') or sale_row[3] or '',
+            invoice_number or sale_row["invoice_number"],
+            body.get('customer_name') or sale_row["customer_name"] or '',
+            body.get('customer_mobile') or sale_row["customer_mobile"] or '',
             body.get('return_date') or None,
             body.get('reason', '').strip(),
             refund_amount,
