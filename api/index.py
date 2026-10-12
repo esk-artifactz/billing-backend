@@ -3116,6 +3116,7 @@ def attendance_report():
             present   = row["present_days"]
             half      = row["half_days"]
             effective = present + half * 0.5
+            base      = round(row["gross_earned"], 2)
             gross     = round(row["gross_earned"] + row["ot_pay"], 2)
             report.append({
                 "employee_id":              eid,
@@ -3129,6 +3130,7 @@ def attendance_report():
                 "half_days":                half,
                 "leave_days":               row["leave_days"],
                 "effective_days":           effective,
+                "base_earned":              base,
                 "ot_pay":                   round(row["ot_pay"], 2),
                 "gross_earned":             gross,
             })
@@ -3321,6 +3323,8 @@ def attendance_detail():
 
         total_paid  = sum(p["amount_paid"] for p in payments) + sum(e["amount"] for e in exp_payments)
         total_adv   = sum(a["amount"] for a in advances if not a["recovered"])
+        base_earned  = sum(d["day_pay"] for d in rows)
+        total_ot_pay = sum(d["ot_pay"] for d in rows)
         gross_earned = sum(d["total_pay"] for d in rows)
         balance      = round(gross_earned - total_paid - total_adv, 2)
 
@@ -3330,6 +3334,8 @@ def attendance_detail():
             "exp_payments": exp_payments,
             "advances":    advances,
             "summary": {
+                "base_earned":  round(base_earned, 2),
+                "total_ot_pay": round(total_ot_pay, 2),
                 "gross_earned": round(gross_earned, 2),
                 "total_paid":   round(total_paid, 2),
                 "total_advance": round(total_adv, 2),
