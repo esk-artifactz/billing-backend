@@ -561,6 +561,12 @@ def ensure_db():
                     END IF;
                 END$$
             """)
+            # Backfill: rows saved with an explicit ot_rate of 0 should use the
+            # designation ot_rate (or daily_rate/8 fallback) instead of paying 0
+            cur.execute("""
+                UPDATE attendance SET ot_rate = NULL
+                WHERE ot_hours > 0 AND ot_rate = 0
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(att_date)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_emp  ON attendance(employee_id)")
 
@@ -3055,9 +3061,9 @@ def attendance_report():
                 -- OT rate priority: per-row override → attendance designation ot_rate
                 --   → default designation ot_rate → fallback: day_rate / 8 hours
                 COALESCE(
-                    a.ot_rate,
-                    att_d.ot_rate,
-                    def_d.ot_rate,
+                    NULLIF(a.ot_rate, 0),
+                    NULLIF(att_d.ot_rate, 0),
+                    NULLIF(def_d.ot_rate, 0),
                     COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
                 ) AS ot_hourly_rate
             FROM employees e
@@ -3234,7 +3240,7 @@ def attendance_detail():
                 e.daily_rate           AS emp_daily_rate,
                 COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) AS day_rate,
                 COALESCE(a.ot_hours, 0) AS ot_hours,
-                COALESCE(a.ot_rate, att_d.ot_rate, def_d.ot_rate,
+                COALESCE(NULLIF(a.ot_rate, 0), NULLIF(att_d.ot_rate, 0), NULLIF(def_d.ot_rate, 0),
                     COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
                 ) AS ot_hr_rate,
                 a.marked_by
