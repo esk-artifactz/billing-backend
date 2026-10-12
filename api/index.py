@@ -3053,12 +3053,12 @@ def attendance_report():
                 COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) AS day_rate,
                 COALESCE(a.ot_hours, 0) AS ot_hours,
                 -- OT rate priority: per-row override → attendance designation ot_rate
-                --   → default designation ot_rate → 0 (not configured means no OT pay)
+                --   → default designation ot_rate → fallback: day_rate / 8 hours
                 COALESCE(
                     a.ot_rate,
                     att_d.ot_rate,
                     def_d.ot_rate,
-                    0
+                    COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
                 ) AS ot_hourly_rate
             FROM employees e
             LEFT JOIN designations def_d ON def_d.id = e.default_designation_id
@@ -3232,7 +3232,9 @@ def attendance_detail():
                 e.daily_rate           AS emp_daily_rate,
                 COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) AS day_rate,
                 COALESCE(a.ot_hours, 0) AS ot_hours,
-                COALESCE(a.ot_rate, att_d.ot_rate, def_d.ot_rate, 0)          AS ot_hr_rate,
+                COALESCE(a.ot_rate, att_d.ot_rate, def_d.ot_rate,
+                    COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
+                ) AS ot_hr_rate,
                 a.marked_by
             FROM attendance a
             JOIN employees e   ON e.id = a.employee_id
