@@ -10,7 +10,7 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 import jwt
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from passlib.context import CryptContext
@@ -188,6 +188,11 @@ def ensure_db():
             cur.execute("""
                 ALTER TABLE sales
                 ADD COLUMN IF NOT EXISTS amount_tendered NUMERIC(12,2)
+            """)
+            # Split payments — {"cash": 150, "upi": 100}; payment_method = 'split' when used
+            cur.execute("""
+                ALTER TABLE sales
+                ADD COLUMN IF NOT EXISTS payment_splits JSONB
             """)
             cur.execute("""
                 ALTER TABLE sales
@@ -1572,6 +1577,7 @@ def checkout():
     parcel_charge    = float(body.get("parcel_charge") or 0)
     payment_method   = (body.get("payment_method") or "cash").strip()
     amount_tendered  = body.get("amount_tendered")
+    payment_splits   = body.get("payment_splits")  # {"cash": 150, "upi": 100} — optional
     customer_name    = (body.get("customer_name") or "").strip() or None
     customer_mobile  = (body.get("customer_mobile") or "").strip() or None
     cashier_username = payload.get("username", "unknown")
@@ -1618,6 +1624,36 @@ def checkout():
         grand_before_round = subtotal - discount_total + tax_total + parcel_charge
         grand_total        = round(grand_before_round)
         round_off          = round(grand_total - grand_before_round, 2)
+
+        # ── Split payments ────────────────────────────────────────────────
+        # {"cash": 150.0, "upi": 100.0, "card": 0} — must sum to grand_total
+        splits_clean = None
+        if payment_splits:
+            if not isinstance(payment_splits, dict):
+                return jsonify({"detail": "payment_splits must be an object"}), 400
+            allowed = {"cash", "upi", "card", "bank"}
+            splits_clean = {}
+            for k, v in payment_splits.items():
+                k = str(k).strip().lower()
+                if k not in allowed:
+                    return jsonify({"detail": f"Unsupported payment mode in split: {k}"}), 400
+                try:
+                    amt = float(v or 0)
+                except (TypeError, ValueError):
+                    return jsonify({"detail": f"Invalid amount for {k}"}), 400
+                if amt > 0:
+                    splits_clean[k] = round(amt, 2)
+            if splits_clean:
+                split_sum = round(sum(splits_clean.values()), 2)
+                if split_sum != round(float(grand_total), 2):
+                    return jsonify({"detail":
+                        f"Split amounts (₹{split_sum:.2f}) must equal bill total (₹{grand_total:.2f})"}), 400
+                if len(splits_clean) > 1:
+                    payment_method = "split"
+                else:
+                    payment_method = next(iter(splits_clean))
+                amount_tendered = amount_tendered or split_sum
+
         change_amount      = round(float(amount_tendered or grand_total) - grand_total, 2) if amount_tendered else 0.0
 
         invoice_number = _generate_invoice_number(cur)
@@ -1627,14 +1663,15 @@ def checkout():
             """
             INSERT INTO sales (invoice_number, cashier_username, sale_time, subtotal, discount_total, tax_total,
                                parcel_charge, round_off, grand_total, payment_method, amount_tendered, change_amount,
-                               customer_name, customer_mobile, status)
-            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
+                               customer_name, customer_mobile, payment_splits, status)
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed')
             RETURNING *
             """,
             (invoice_number, cashier_username, round(subtotal, 2), round(discount_total, 2),
              round(tax_total, 2), round(parcel_charge, 2), round_off, grand_total, payment_method,
              float(amount_tendered) if amount_tendered else None, change_amount,
-             customer_name, customer_mobile),
+             customer_name, customer_mobile,
+             Json(splits_clean) if splits_clean else None),
         )
         sale = cur.fetchone()
         sale_id = sale["id"]
