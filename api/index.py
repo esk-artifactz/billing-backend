@@ -544,6 +544,25 @@ def ensure_db():
                     END IF;
                 END$$
             """)
+            # Designation change history — effective_from lets pay reports use
+            # whichever designation was in effect on each attendance date.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS employee_designation_history (
+                    employee_id    BIGINT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+                    designation_id BIGINT REFERENCES designations(id) ON DELETE SET NULL,
+                    effective_from DATE   NOT NULL,
+                    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (employee_id, effective_from)
+                )
+            """)
+            # Seed: employees with a designation but no history get one at join_date
+            cur.execute("""
+                INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
+                SELECT e.id, e.default_designation_id, COALESCE(e.join_date, CURRENT_DATE)
+                FROM employees e
+                WHERE e.default_designation_id IS NOT NULL
+                ON CONFLICT (employee_id, effective_from) DO NOTHING
+            """)
             # Migration: rename monthly_salary -> daily_rate for existing tables
             cur.execute("""
                 DO $$
@@ -3044,6 +3063,7 @@ def create_employee():
     role                   = (body.get("role") or "Staff").strip()
     join_date              = (body.get("join_date") or "").strip() or None
     default_designation_id = body.get("default_designation_id") or None
+    desig_effective_from   = (body.get("designation_effective_from") or "").strip() or None
 
     if not full_name:
         return jsonify({"detail": "full_name is required"}), 400
@@ -3075,6 +3095,14 @@ def create_employee():
             (emp_code, full_name, phone or None, role, daily_rate, join_date, default_designation_id),
         )
         new_id = cur.fetchone()["id"]
+        # Record designation assignment in history (defaults to join_date or today)
+        if default_designation_id:
+            cur.execute("""
+                INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
+                VALUES (%s, %s, COALESCE(%s::DATE, COALESCE(%s::DATE, CURRENT_DATE)))
+                ON CONFLICT (employee_id, effective_from) DO UPDATE
+                SET designation_id = EXCLUDED.designation_id
+            """, (new_id, default_designation_id, desig_effective_from, join_date))
         conn.commit()
 
         # Fetch with designation info joined
@@ -3153,6 +3181,16 @@ def update_employee(emp_id: int):
             f"UPDATE employees SET {', '.join(fields)} WHERE id = %s",
             values,
         )
+        # Record designation change in history so reports use the right rate per date
+        if default_designation_id is not None:
+            did_val = int(default_designation_id) if default_designation_id else None
+            eff = (body.get("designation_effective_from") or "").strip() or None
+            cur.execute("""
+                INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
+                VALUES (%s, %s, COALESCE(%s::DATE, CURRENT_DATE))
+                ON CONFLICT (employee_id, effective_from) DO UPDATE
+                SET designation_id = EXCLUDED.designation_id
+            """, (emp_id, did_val, eff))
         conn.commit()
 
         # Fetch the updated row with designation info joined
@@ -3302,14 +3340,19 @@ def get_attendance():
                    a.ot_hours,
                    a.ot_rate
             FROM employees e
-            LEFT JOIN designations def_d ON def_d.id = e.default_designation_id
+            -- Designation effective on the requested date (history → current default)
+            LEFT JOIN designations def_d ON def_d.id = COALESCE(
+                (SELECT h.designation_id FROM employee_designation_history h
+                  WHERE h.employee_id = e.id AND h.effective_from <= %s::DATE
+                  ORDER BY h.effective_from DESC LIMIT 1),
+                e.default_designation_id)
             LEFT JOIN attendance a
                    ON a.employee_id = e.id AND a.att_date = %s::DATE
             LEFT JOIN designations att_d ON att_d.id = a.designation_id
             WHERE e.active = TRUE
             ORDER BY e.full_name
             """,
-            (att_date,),
+            (att_date, att_date),
         )
         rows = []
         for r in cur.fetchall():
@@ -3373,7 +3416,12 @@ def attendance_report():
                     COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
                 ) AS ot_hourly_rate
             FROM employees e
-            LEFT JOIN designations def_d ON def_d.id = e.default_designation_id
+            -- Designation effective on each attendance date (history → current default)
+            LEFT JOIN designations def_d ON def_d.id = COALESCE(
+                (SELECT h.designation_id FROM employee_designation_history h
+                  WHERE h.employee_id = e.id AND h.effective_from <= a.att_date
+                  ORDER BY h.effective_from DESC LIMIT 1),
+                e.default_designation_id)
             LEFT JOIN attendance a
                    ON a.employee_id = e.id
                   AND EXTRACT(YEAR  FROM a.att_date) = %s
@@ -3553,7 +3601,12 @@ def attendance_detail():
             FROM attendance a
             JOIN employees e   ON e.id = a.employee_id
             LEFT JOIN designations att_d ON att_d.id = a.designation_id
-            LEFT JOIN designations def_d ON def_d.id = e.default_designation_id
+            -- Designation effective on that attendance date (history → current default)
+            LEFT JOIN designations def_d ON def_d.id = COALESCE(
+                (SELECT h.designation_id FROM employee_designation_history h
+                  WHERE h.employee_id = e.id AND h.effective_from <= a.att_date
+                  ORDER BY h.effective_from DESC LIMIT 1),
+                e.default_designation_id)
             WHERE a.employee_id = %s
               AND EXTRACT(YEAR  FROM a.att_date) = %s
               AND EXTRACT(MONTH FROM a.att_date) = %s
