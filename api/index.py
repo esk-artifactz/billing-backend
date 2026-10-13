@@ -3416,16 +3416,16 @@ def attendance_report():
                     COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0
                 ) AS ot_hourly_rate
             FROM employees e
+            LEFT JOIN attendance a
+                   ON a.employee_id = e.id
+                  AND EXTRACT(YEAR  FROM a.att_date) = %s
+                  AND EXTRACT(MONTH FROM a.att_date) = %s
             -- Designation effective on each attendance date (history → current default)
             LEFT JOIN designations def_d ON def_d.id = COALESCE(
                 (SELECT h.designation_id FROM employee_designation_history h
                   WHERE h.employee_id = e.id AND h.effective_from <= a.att_date
                   ORDER BY h.effective_from DESC LIMIT 1),
                 e.default_designation_id)
-            LEFT JOIN attendance a
-                   ON a.employee_id = e.id
-                  AND EXTRACT(YEAR  FROM a.att_date) = %s
-                  AND EXTRACT(MONTH FROM a.att_date) = %s
             LEFT JOIN designations att_d ON att_d.id = a.designation_id
             WHERE e.active = TRUE
             ORDER BY e.id, a.att_date
