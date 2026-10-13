@@ -3034,7 +3034,14 @@ def list_employees():
         cur.execute("""
             SELECT e.*,
                    d.name       AS designation_name,
-                   d.daily_rate AS designation_daily_rate
+                   d.daily_rate AS designation_daily_rate,
+                   -- When the current designation assignment took effect
+                   (SELECT MAX(h.effective_from)
+                      FROM employee_designation_history h
+                     WHERE h.employee_id    = e.id
+                       AND h.designation_id = e.default_designation_id
+                       AND h.effective_from <= CURRENT_DATE
+                   ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
             ORDER BY e.full_name
@@ -3109,7 +3116,13 @@ def create_employee():
         cur.execute("""
             SELECT e.*,
                    d.name       AS designation_name,
-                   d.daily_rate AS designation_daily_rate
+                   d.daily_rate AS designation_daily_rate,
+                   (SELECT MAX(h.effective_from)
+                      FROM employee_designation_history h
+                     WHERE h.employee_id    = e.id
+                       AND h.designation_id = e.default_designation_id
+                       AND h.effective_from <= CURRENT_DATE
+                   ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
             WHERE e.id = %s
@@ -3138,9 +3151,11 @@ def update_employee(emp_id: int):
     conn = get_conn()
     cur  = get_cur(conn)
     try:
-        cur.execute("SELECT id FROM employees WHERE id = %s", (emp_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT id, default_designation_id FROM employees WHERE id = %s", (emp_id,))
+        emp_row = cur.fetchone()
+        if not emp_row:
             return jsonify({"detail": "Employee not found"}), 404
+        old_designation_id = emp_row["default_designation_id"]
 
         body = request.get_json(silent=True) or {}
         fields, values = [], []
@@ -3191,13 +3206,34 @@ def update_employee(emp_id: int):
                 ON CONFLICT (employee_id, effective_from) DO UPDATE
                 SET designation_id = EXCLUDED.designation_id
             """, (emp_id, did_val, eff))
+            # If the designation actually changed and nothing covers the day
+            # before effective_from, pin the OLD designation there — otherwise
+            # past months would fall back to the NEW default designation.
+            if did_val != old_designation_id and old_designation_id is not None:
+                cur.execute("""
+                    INSERT INTO employee_designation_history
+                        (employee_id, designation_id, effective_from)
+                    SELECT %s, %s, (COALESCE(%s::DATE, CURRENT_DATE) - INTERVAL '1 day')::DATE
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM employee_designation_history
+                        WHERE employee_id = %s
+                          AND effective_from < COALESCE(%s::DATE, CURRENT_DATE)
+                    )
+                    ON CONFLICT (employee_id, effective_from) DO NOTHING
+                """, (emp_id, old_designation_id, eff, emp_id, eff))
         conn.commit()
 
         # Fetch the updated row with designation info joined
         cur.execute("""
             SELECT e.*,
                    d.name       AS designation_name,
-                   d.daily_rate AS designation_daily_rate
+                   d.daily_rate AS designation_daily_rate,
+                   (SELECT MAX(h.effective_from)
+                      FROM employee_designation_history h
+                     WHERE h.employee_id    = e.id
+                       AND h.designation_id = e.default_designation_id
+                       AND h.effective_from <= CURRENT_DATE
+                   ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
             WHERE e.id = %s
