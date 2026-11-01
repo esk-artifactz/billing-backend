@@ -6548,6 +6548,10 @@ def expense_report():
     date_to      = request.args.get("to")
     cat_filter   = request.args.get("category")
     mode_filter  = request.args.get("payment_mode")
+    try:   # how many transactions to return (category drill-down asks for all)
+        recent_limit = max(1, min(int(request.args.get("recent_limit") or 50), 5000))
+    except ValueError:
+        recent_limit = 50
 
     ensure_db()
     conn = get_conn(); cur = get_cur(conn)
@@ -6654,13 +6658,13 @@ def expense_report():
             for r in cur.fetchall()
         ]
 
-        # Recent transactions (last 50 matching the filters)
+        # Recent transactions (last `recent_limit` matching the filters)
         cur.execute(f"""
             SELECT * FROM daily_expenses
             WHERE {w}
             ORDER BY expense_date DESC, created_at DESC
-            LIMIT 50
-        """, vals)
+            LIMIT %s
+        """, vals + [recent_limit])
         recent = [_expense_to_dict(r) for r in cur.fetchall()]
 
         return jsonify({
