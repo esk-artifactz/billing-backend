@@ -2621,14 +2621,16 @@ def category_sales_stats():
     date_to   = request.args.get("date_to")    # inclusive end
 
     # Build a sale_time filter clause used in all three queries
-    # We cast to DATE so the comparison is day-level, not timestamp-level
+    # Day-level comparison on the IST date (sale_time is stored in UTC), same as
+    # Bill History / Daily Expenses — otherwise 00:00–05:30 IST bills fall on the previous day
+    ist_date = lambda col: f"(({col}) AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::DATE"
     date_conditions = []
     date_params: list = []
     if date_from:
-        date_conditions.append("s.sale_time::DATE >= %s")
+        date_conditions.append(f"{ist_date('s.sale_time')} >= %s")
         date_params.append(date_from)
     if date_to:
-        date_conditions.append("s.sale_time::DATE <= %s")
+        date_conditions.append(f"{ist_date('s.sale_time')} <= %s")
         date_params.append(date_to)
     date_where = ("AND " + " AND ".join(date_conditions)) if date_conditions else ""
 
@@ -2636,10 +2638,10 @@ def category_sales_stats():
     summary_conditions = []
     summary_params: list = []
     if date_from:
-        summary_conditions.append("sale_time::DATE >= %s")
+        summary_conditions.append(f"{ist_date('sale_time')} >= %s")
         summary_params.append(date_from)
     if date_to:
-        summary_conditions.append("sale_time::DATE <= %s")
+        summary_conditions.append(f"{ist_date('sale_time')} <= %s")
         summary_params.append(date_to)
     summary_where = ("AND " + " AND ".join(summary_conditions)) if summary_conditions else ""
 
@@ -2657,8 +2659,12 @@ def category_sales_stats():
                 COALESCE(SUM(si.line_total), 0)               AS total_revenue
             FROM categories c
             LEFT JOIN products p  ON p.category_id = c.id
-            LEFT JOIN sale_items si ON si.product_id = p.id
-            LEFT JOIN sales s       ON s.id = si.sale_id {date_where}
+            -- Only sale items whose sale is completed and inside the date range.
+            -- (Filtering on a plain LEFT JOIN to sales kept every sale item → all-time totals.)
+            LEFT JOIN (
+                sale_items si
+                JOIN sales s ON s.id = si.sale_id AND s.status = 'completed' {date_where}
+            ) ON si.product_id = p.id
             GROUP BY c.id, c.name
             ORDER BY total_qty DESC
         """, date_params)
@@ -2682,7 +2688,7 @@ def category_sales_stats():
             FROM sale_items si
             JOIN products  p ON p.id = si.product_id
             JOIN categories c ON c.id = p.category_id
-            JOIN sales      s ON s.id = si.sale_id {date_where}
+            JOIN sales      s ON s.id = si.sale_id AND s.status = 'completed' {date_where}
             GROUP BY p.id, p.name, c.name
             ORDER BY total_qty DESC
             LIMIT 10
