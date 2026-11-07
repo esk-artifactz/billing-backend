@@ -2910,7 +2910,9 @@ def list_sales():
     IST_DATE = "(sale_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::DATE"
 
     where, params = ["1=1"], []
-    if payload.get("role") == "Cashier":
+    # Sales Return page looks up older bills to return items — allowed for Cashiers too
+    for_return = request.args.get("purpose") == "return" and (search or date_filter)
+    if payload.get("role") == "Cashier" and not for_return:
         # Cashiers can only see today's bills — date param is ignored
         today_ist = datetime.now(timezone.utc).astimezone(IST).strftime("%Y-%m-%d")
         where.append(f"{IST_DATE} = %s"); params.append(today_ist)
@@ -5770,7 +5772,8 @@ def list_purchase_orders():
 @app.get("/purchase-orders/<int:po_id>")
 @app.get("/api/purchase-orders/<int:po_id>")
 def get_purchase_order(po_id: int):
-    admin, err_resp = require_admin()
+    # Cashiers receive stock too — they need the PO details
+    admin, err_resp = require_auth()
     if err_resp:
         return err_resp
 
