@@ -4469,9 +4469,9 @@ def attendance_detail():
 
 # ---------------------------------------------------------------------------
 # Bonus — mark an employee bonus-eligible for a month (POST /api/salary/bonus) — Admin only
-# Body: { employee_id, month: YYYY-MM, eligible: bool, amount? }
-# eligible=true grants the bonus (employee's bonus type + amount, or the given amount);
-# eligible=false removes it. The bonus is added to that month's salary due.
+# Body: { employee_id, month: YYYY-MM, eligible: bool, bonus_type, amount }
+# eligible=true adds/updates the bonus for that month only (type + amount entered in the
+# report); eligible=false removes it. The bonus is added to that month's salary due.
 # ---------------------------------------------------------------------------
 
 @app.post("/salary/bonus")
@@ -4489,27 +4489,28 @@ def set_salary_bonus():
     ensure_db()
     conn = get_conn(); cur = get_cur(conn)
     try:
-        cur.execute("SELECT bonus_type, COALESCE(bonus_amount, 0) AS bonus_amount FROM employees WHERE id = %s",
-                    (employee_id,))
-        emp = cur.fetchone()
-        if not emp:
+        cur.execute("SELECT id FROM employees WHERE id = %s", (employee_id,))
+        if not cur.fetchone():
             return jsonify({"detail": "Employee not found"}), 404
         if not eligible:
             cur.execute("DELETE FROM employee_bonuses WHERE employee_id = %s AND bonus_month = %s", (employee_id, month))
             conn.commit()
             return jsonify({"message": "Bonus removed for this month", "eligible": False, "amount": 0})
+        bonus_type = (body.get("bonus_type") or "").strip()[:30]
         try:
-            amount = float(body["amount"]) if body.get("amount") not in (None, "") else float(emp["bonus_amount"])
+            amount = float(body.get("amount") or 0)
         except (TypeError, ValueError):
             return jsonify({"detail": "Bonus amount must be a number"}), 400
+        if not bonus_type:
+            return jsonify({"detail": "Select the bonus type"}), 400
         if amount <= 0:
-            return jsonify({"detail": "Set a bonus amount for this employee first (Employees tab → Edit)"}), 400
+            return jsonify({"detail": "Enter a bonus amount greater than 0"}), 400
         cur.execute(
             """INSERT INTO employee_bonuses (employee_id, bonus_month, bonus_type, amount, marked_by)
                VALUES (%s, %s, %s, %s, %s)
                ON CONFLICT (employee_id, bonus_month) DO UPDATE
                SET bonus_type = EXCLUDED.bonus_type, amount = EXCLUDED.amount, marked_by = EXCLUDED.marked_by""",
-            (employee_id, month, emp["bonus_type"], round(amount, 2), admin.get("username", "Admin")),
+            (employee_id, month, bonus_type, round(amount, 2), admin.get("username", "Admin")),
         )
         conn.commit()
         return jsonify({"message": "Bonus granted for this month", "eligible": True, "amount": round(amount, 2)})
