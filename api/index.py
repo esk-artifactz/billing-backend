@@ -574,7 +574,7 @@ def ensure_db():
             # Seed: employees with a designation but no history get one at join_date
             cur.execute("""
                 INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
-                SELECT e.id, e.default_designation_id, COALESCE(e.join_date, CURRENT_DATE)
+                SELECT e.id, e.default_designation_id, COALESCE(e.join_date, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)
                 FROM employees e
                 WHERE e.default_designation_id IS NOT NULL
                 ON CONFLICT (employee_id, effective_from) DO NOTHING
@@ -1083,6 +1083,18 @@ def ensure_db():
                 ON CONFLICT (name) DO NOTHING
             """)
 
+            # ── Date columns default to TODAY IN IST (server/DB run in UTC, so a plain
+            # CURRENT_DATE default gave yesterday's date between 00:00 and 05:30 IST)
+            for tbl, col in (
+                ("expense_payment_history", "paid_on"), ("sales_returns", "return_date"),
+                ("purchase_returns", "return_date"), ("employees", "join_date"),
+                ("advances", "given_on"), ("employee_loans", "loan_date"),
+                ("daily_expenses", "expense_date"), ("supplier_ledger", "entry_date"),
+                ("raw_material_consumption", "consumption_date"), ("raw_material_purchases", "purchase_date"),
+                ("raw_material_bills", "bill_date"),
+            ):
+                cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT ((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)")
+
         conn.commit()
         _db_ready = True
         # Explicitly release the advisory lock before closing so other
@@ -1234,10 +1246,10 @@ def _batch_consume(cur, pid, qty, batch_id=None, expired_first=False):
     to supplier). A given batch_id is always used first."""
     _batch_ensure(cur, pid)
     order = "expiry_date NULLS LAST, id" if expired_first else \
-            "(expiry_date IS NOT NULL AND expiry_date < CURRENT_DATE), expiry_date NULLS LAST, id"
+            "(expiry_date IS NOT NULL AND expiry_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), expiry_date NULLS LAST, id"
     cur.execute(
         f"""SELECT id, batch_no, expiry_date, qty_available,
-                   (expiry_date IS NOT NULL AND expiry_date < CURRENT_DATE) AS expired
+                   (expiry_date IS NOT NULL AND expiry_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS expired
             FROM product_batches
             WHERE product_id = %s AND qty_available > 0
             ORDER BY (id = %s) DESC, {order}
@@ -2090,7 +2102,7 @@ def list_products():
             LEFT JOIN (
                 SELECT product_id,
                        COUNT(*) AS batch_count,
-                       SUM(qty_available) FILTER (WHERE expiry_date < CURRENT_DATE) AS expired_stock
+                       SUM(qty_available) FILTER (WHERE expiry_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS expired_stock
                 FROM product_batches
                 WHERE qty_available > 0
                 GROUP BY product_id
@@ -2119,8 +2131,8 @@ def list_product_batches(product_id: int):
         cur.execute(
             f"""
             SELECT b.*, po.po_number,
-                   (b.expiry_date IS NOT NULL AND b.expiry_date < CURRENT_DATE) AS expired,
-                   (b.expiry_date - CURRENT_DATE) AS days_left
+                   (b.expiry_date IS NOT NULL AND b.expiry_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS expired,
+                   (b.expiry_date - (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS days_left
             FROM product_batches b
             LEFT JOIN purchase_orders po ON po.id = b.po_id
             WHERE b.product_id = %s {"" if include_empty else "AND b.qty_available > 0"}
@@ -2569,8 +2581,9 @@ def checkout():
 
 # ---------------------------------------------------------------------------
 # Billing — Update a completed sale (PUT /api/billing/sales/<id>)
-# Editable: payment_method (+ splits), amount_tendered, customer details,
-#           discount_total, parcel_charge — grand_total is recomputed.
+# Editable: items (qty / price / add / remove — stock adjusted), payment_method
+#           (+ splits), amount_tendered, customer details, discount_total,
+#           parcel_charge, other_charge/description — totals are recomputed.
 # ---------------------------------------------------------------------------
 
 @app.put("/billing/sales/<int:sale_id>")
@@ -2598,8 +2611,83 @@ def update_sale(sale_id: int):
         discount = float(body.get("discount_total", row["discount_total"] or 0))
         parcel   = float(body.get("parcel_charge",  row["parcel_charge"]  or 0))
         other    = float(body.get("other_charge",   row.get("other_charge")   or 0))
+        other_desc = (body["other_description"] or "").strip()[:200] or None if "other_description" in body \
+                     else row.get("other_description")
         if discount < 0 or parcel < 0 or other < 0:
             return jsonify({"detail": "Discount, parcel charge and Other Things cannot be negative"}), 400
+
+        # ── Items edit: quantities / prices / removed / added lines ─────────
+        # Body: items: [{ product_id, quantity, unit_price }]
+        # Stock taken by the old lines is put back to its batches, then the new
+        # lines take stock again (FEFO) — so stock always matches the edited bill.
+        if body.get("items") is not None:
+            cur.execute("SELECT 1 FROM sales_returns WHERE sale_id = %s LIMIT 1", (sale_id,))
+            if cur.fetchone():
+                return jsonify({"detail": "This bill has a sales return — its items can't be edited"}), 400
+            new_lines = []
+            for it in body["items"]:
+                try:
+                    qty   = round(float(it.get("quantity") or 0), 3)
+                    price = round(float(it.get("unit_price")), 2)
+                except (TypeError, ValueError):
+                    return jsonify({"detail": "Item quantity and price must be numbers"}), 400
+                if qty <= 0:
+                    continue
+                if price < 0:
+                    return jsonify({"detail": "Item price cannot be negative"}), 400
+                cur.execute("SELECT * FROM products WHERE id = %s", (it.get("product_id"),))
+                prod = cur.fetchone()
+                if not prod:
+                    return jsonify({"detail": f"Product id={it.get('product_id')} not found"}), 400
+                tax_amt = round(price * qty * float(prod["gst_percentage"] or 0) / 100, 2)
+                new_lines.append({"prod": prod, "qty": qty, "price": price, "tax": tax_amt,
+                                  "line_total": round(price * qty + tax_amt, 2)})
+            if not new_lines and other <= 0:
+                return jsonify({"detail": "A bill needs at least one item (or an Other Things amount)"}), 400
+
+            inv = row["invoice_number"]
+            # 1. Put back stock taken by the current lines
+            cur.execute("""SELECT si.id, si.product_id, si.quantity, p.track_stock, p.mfg_date, p.expiry_date
+                           FROM sale_items si JOIN products p ON p.id = si.product_id
+                           WHERE si.sale_id = %s""", (sale_id,))
+            for old in cur.fetchall():
+                if not old["track_stock"]:
+                    continue
+                pid = old["product_id"]
+                _batch_ensure(cur, pid)
+                cur.execute("SELECT batch_id, quantity FROM sale_item_batches WHERE sale_item_id = %s", (old["id"],))
+                allocs = cur.fetchall()
+                for a in allocs:
+                    _batch_add(cur, pid, a["quantity"], batch_id=a["batch_id"])
+                if not allocs:   # sold before batch tracking — return it as an adjustment batch
+                    _batch_add(cur, pid, old["quantity"], "ADJ", old["mfg_date"], old["expiry_date"])
+                before, after = _sync_product_stock(cur, pid)
+                _log_inventory(cur, pid, "sale_edit", round(after - before, 3), before, after, "sale", inv,
+                               f"Bill {inv} edited — stock put back")
+            cur.execute("DELETE FROM sale_items WHERE sale_id = %s", (sale_id,))   # cascades sale_item_batches
+
+            # 2. Save the new lines and take their stock
+            subtotal, tax = 0.0, 0.0
+            for ln in new_lines:
+                p = ln["prod"]
+                cur.execute(
+                    """INSERT INTO sale_items (sale_id, product_id, product_name, barcode, quantity, unit_price,
+                                               discount_amount, tax_amount, line_total)
+                       VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s) RETURNING id""",
+                    (sale_id, p["id"], p["name"], p["barcode"], ln["qty"], ln["price"], ln["tax"], ln["line_total"]),
+                )
+                si_id = cur.fetchone()["id"]
+                subtotal += ln["price"] * ln["qty"]
+                tax      += ln["tax"]
+                if p["track_stock"] and p["current_stock"] is not None:
+                    allocs = _batch_consume(cur, p["id"], ln["qty"])
+                    for a in allocs:
+                        cur.execute("INSERT INTO sale_item_batches (sale_item_id, batch_id, quantity) VALUES (%s, %s, %s)",
+                                    (si_id, a["batch_id"], a["qty"]))
+                    before, after = _sync_product_stock(cur, p["id"])
+                    _log_inventory(cur, p["id"], "sale_edit", round(after - before, 3), before, after, "sale", inv,
+                                   f"Bill {inv} edited", allocs)
+            subtotal, tax = round(subtotal, 2), round(tax, 2)
 
         grand_before = round(subtotal - discount + tax + parcel + other, 2)
         grand_total  = _round_rupee(grand_before)
@@ -2647,9 +2735,12 @@ def update_sale(sale_id: int):
                 payment_splits  = %s,
                 amount_tendered = %s,
                 change_amount   = %s,
+                subtotal        = %s,
+                tax_total       = %s,
                 discount_total  = %s,
                 parcel_charge   = %s,
                 other_charge    = %s,
+                other_description = %s,
                 round_off       = %s,
                 grand_total     = %s,
                 customer_name   = %s,
@@ -2660,7 +2751,8 @@ def update_sale(sale_id: int):
             payment_method,
             Json(splits_clean) if splits_clean else (row["payment_splits"] if payment_method == "split" else None),
             amount_tendered, change_amount,
-            round(discount, 2), round(parcel, 2), round(other, 2), round_off, grand_total,
+            round(subtotal, 2), round(tax, 2),
+            round(discount, 2), round(parcel, 2), round(other, 2), other_desc, round_off, grand_total,
             customer_name, customer_mobile,
             sale_id,
         ))
@@ -3485,7 +3577,7 @@ def stock_alerts():
 
         def _expiry_rows(condition):
             cur.execute(f"""
-                SELECT e.*, (e.expiry_date - CURRENT_DATE) AS days_left,
+                SELECT e.*, (e.expiry_date - (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS days_left,
                        c.name AS category_name, s.name AS supplier_name
                 FROM ({expiry_src}) e
                 LEFT JOIN categories c ON c.id = e.category_id
@@ -3509,9 +3601,9 @@ def stock_alerts():
             } for r in cur.fetchall()]
 
         # Already expired: expiry_date < today
-        already_expired = _expiry_rows("e.expiry_date < CURRENT_DATE")
+        already_expired = _expiry_rows("e.expiry_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE")
         # Expiring soon: 0 <= days until expiry <= 7
-        expiry_soon = _expiry_rows("e.expiry_date >= CURRENT_DATE AND e.expiry_date <= CURRENT_DATE + INTERVAL '7 days'")
+        expiry_soon = _expiry_rows("e.expiry_date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE AND e.expiry_date <= (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE + INTERVAL '7 days'")
 
         # Summary counts
         cur.execute("""
@@ -3700,7 +3792,7 @@ def list_employees():
                       FROM employee_designation_history h
                      WHERE h.employee_id    = e.id
                        AND h.designation_id = e.default_designation_id
-                       AND h.effective_from <= CURRENT_DATE
+                       AND h.effective_from <= (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE
                    ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
@@ -3762,7 +3854,7 @@ def create_employee():
             INSERT INTO employees
                 (emp_code, full_name, phone, role, daily_rate, join_date, default_designation_id,
                  bonus_type, bonus_amount)
-            VALUES (%s, %s, %s, %s, %s, COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s, %s)
             RETURNING id
             """,
             (emp_code, full_name, phone or None, role, daily_rate, join_date, default_designation_id,
@@ -3773,7 +3865,7 @@ def create_employee():
         if default_designation_id:
             cur.execute("""
                 INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
-                VALUES (%s, %s, COALESCE(%s::DATE, COALESCE(%s::DATE, CURRENT_DATE)))
+                VALUES (%s, %s, COALESCE(%s::DATE, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)))
                 ON CONFLICT (employee_id, effective_from) DO UPDATE
                 SET designation_id = EXCLUDED.designation_id
             """, (new_id, default_designation_id, desig_effective_from, join_date))
@@ -3788,7 +3880,7 @@ def create_employee():
                       FROM employee_designation_history h
                      WHERE h.employee_id    = e.id
                        AND h.designation_id = e.default_designation_id
-                       AND h.effective_from <= CURRENT_DATE
+                       AND h.effective_from <= (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE
                    ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
@@ -3876,7 +3968,7 @@ def update_employee(emp_id: int):
             eff = (body.get("designation_effective_from") or "").strip() or None
             cur.execute("""
                 INSERT INTO employee_designation_history (employee_id, designation_id, effective_from)
-                VALUES (%s, %s, COALESCE(%s::DATE, CURRENT_DATE))
+                VALUES (%s, %s, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE))
                 ON CONFLICT (employee_id, effective_from) DO UPDATE
                 SET designation_id = EXCLUDED.designation_id
             """, (emp_id, did_val, eff))
@@ -3887,11 +3979,11 @@ def update_employee(emp_id: int):
                 cur.execute("""
                     INSERT INTO employee_designation_history
                         (employee_id, designation_id, effective_from)
-                    SELECT %s, %s, (COALESCE(%s::DATE, CURRENT_DATE) - INTERVAL '1 day')::DATE
+                    SELECT %s, %s, (COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) - INTERVAL '1 day')::DATE
                     WHERE NOT EXISTS (
                         SELECT 1 FROM employee_designation_history
                         WHERE employee_id = %s
-                          AND effective_from < COALESCE(%s::DATE, CURRENT_DATE)
+                          AND effective_from < COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)
                     )
                     ON CONFLICT (employee_id, effective_from) DO NOTHING
                 """, (emp_id, old_designation_id, eff, emp_id, eff))
@@ -3906,7 +3998,7 @@ def update_employee(emp_id: int):
                       FROM employee_designation_history h
                      WHERE h.employee_id    = e.id
                        AND h.designation_id = e.default_designation_id
-                       AND h.effective_from <= CURRENT_DATE
+                       AND h.effective_from <= (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE
                    ) AS designation_effective_from
             FROM employees e
             LEFT JOIN designations d ON d.id = e.default_designation_id
@@ -4022,8 +4114,7 @@ def get_attendance():
 
     att_date = request.args.get("date", "")
     if not att_date:
-        from datetime import date
-        att_date = date.today().isoformat()
+        att_date = _ist_today().isoformat()   # today in IST, not server (UTC) date
 
     ensure_db()
     conn = get_conn()
@@ -4193,8 +4284,7 @@ def attendance_report():
     if err_resp:
         return err_resp
 
-    from datetime import date
-    month = request.args.get("month", date.today().strftime("%Y-%m"))   # YYYY-MM
+    month = request.args.get("month") or _ist_today().strftime("%Y-%m")   # YYYY-MM, default = this month in IST
     try:
         year, mon = int(month.split("-")[0]), int(month.split("-")[1])
     except Exception:
@@ -5020,7 +5110,7 @@ def give_advance():
         cur.execute(
             """
             INSERT INTO advances (employee_id, amount, given_on, given_by, notes)
-            VALUES (%s, %s, COALESCE(%s::DATE, CURRENT_DATE), %s, %s)
+            VALUES (%s, %s, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s)
             RETURNING *
             """,
             (employee_id, amount, given_on, given_by, notes),
@@ -6123,7 +6213,7 @@ def _expense_duplicate(cur, expense_date, category, description, exclude_id=None
     """Return the existing expense with the same date + category + description
     (case / extra spaces ignored), or None. Takes a per-day lock first so two
     quick saves can't both pass the check."""
-    cur.execute("SELECT COALESCE(%s::DATE, CURRENT_DATE) AS d", (expense_date,))
+    cur.execute("SELECT COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE) AS d", (expense_date,))
     day = cur.fetchone()["d"]
     cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"daily_expense:{day}",))
     cur.execute(
@@ -6199,7 +6289,7 @@ def create_daily_expense():
             """
             INSERT INTO daily_expenses
               (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by, employee_id, is_paid, paid_amount, supplier_id)
-            VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (expense_date, category, description, amt,
@@ -7159,7 +7249,7 @@ def create_raw_material_consumption():
                 """
                 INSERT INTO raw_material_consumption
                   (consumption_date, item_id, item_name, unit, quantity_used, used_for, notes, recorded_by)
-                VALUES (COALESCE(%s::DATE, CURRENT_DATE), %s, %s, %s, %s, %s, %s, %s)
+                VALUES (COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (entry_date, item_id, rmi["name"], rmi["unit"],
