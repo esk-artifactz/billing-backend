@@ -1083,6 +1083,18 @@ def ensure_db():
                 ON CONFLICT (name) DO NOTHING
             """)
 
+            # ── Category type: 'product' (Products / billing) or 'raw_material' (Raw Materials only).
+            # First time the column is added, categories used only by raw materials become 'raw_material'.
+            cur.execute("""SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'categories' AND column_name = 'category_type'""")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE categories ADD COLUMN category_type VARCHAR(20) NOT NULL DEFAULT 'product'")
+                cur.execute("""
+                    UPDATE categories c SET category_type = 'raw_material'
+                    WHERE EXISTS (SELECT 1 FROM raw_material_items r WHERE r.category_id = c.id)
+                      AND NOT EXISTS (SELECT 1 FROM products p WHERE p.category_id = c.id)
+                """)
+
             # ── Date columns default to TODAY IN IST (server/DB run in UTC, so a plain
             # CURRENT_DATE default gave yesterday's date between 00:00 and 05:30 IST)
             for tbl, col in (
@@ -1735,6 +1747,9 @@ def update_user(user_id: int):
 # Category routes (any logged-in user)
 # ---------------------------------------------------------------------------
 
+CATEGORY_TYPES = ("product", "raw_material")
+
+
 @app.get("/categories")
 @app.get("/api/categories")
 def list_categories():
@@ -1742,7 +1757,12 @@ def list_categories():
     conn = get_conn()
     cur  = get_cur(conn)
     try:
-        cur.execute("SELECT * FROM categories WHERE active = TRUE ORDER BY name")
+        # ?type=product | raw_material — Products/billing ask for 'product', Raw Material pages for 'raw_material'
+        ctype = (request.args.get("type") or "").strip().lower()
+        if ctype in CATEGORY_TYPES:
+            cur.execute("SELECT * FROM categories WHERE active = TRUE AND category_type = %s ORDER BY name", (ctype,))
+        else:
+            cur.execute("SELECT * FROM categories WHERE active = TRUE ORDER BY category_type, name")
         categories = []
         for row in cur.fetchall():
             d = dict(row)
@@ -1763,9 +1783,12 @@ def create_category():
     name        = (body.get("name") or "").strip()
     description = (body.get("description") or "").strip()
     active      = body.get("active", True)
+    ctype       = (body.get("category_type") or "product").strip().lower()
 
     if not name:
         return jsonify({"detail": "Category name is required"}), 400
+    if ctype not in CATEGORY_TYPES:
+        return jsonify({"detail": "category_type must be 'product' or 'raw_material'"}), 400
 
     ensure_db()
     conn = get_conn()
@@ -1777,11 +1800,11 @@ def create_category():
 
         cur.execute(
             """
-            INSERT INTO categories (name, description, active)
-            VALUES (%s, %s, %s)
+            INSERT INTO categories (name, description, active, category_type)
+            VALUES (%s, %s, %s, %s)
             RETURNING *
             """,
-            (name, description or None, active),
+            (name, description or None, active, ctype),
         )
         category_row = cur.fetchone()
         conn.commit()
@@ -1821,6 +1844,11 @@ def update_category(category_id: int):
             fields.append("description = %s"); values.append(description)
         if active is not None:
             fields.append("active = %s"); values.append(active)
+        if body.get("category_type") is not None:
+            ctype = str(body["category_type"]).strip().lower()
+            if ctype not in CATEGORY_TYPES:
+                return jsonify({"detail": "category_type must be 'product' or 'raw_material'"}), 400
+            fields.append("category_type = %s"); values.append(ctype)
 
         if fields:
             fields.append("updated_at = NOW()")
@@ -1857,6 +1885,9 @@ def delete_category(category_id: int):
         cur.execute("SELECT id FROM products WHERE category_id = %s LIMIT 1", (category_id,))
         if cur.fetchone():
             return jsonify({"detail": "Cannot delete category that is in use by products"}), 400
+        cur.execute("SELECT id FROM raw_material_items WHERE category_id = %s LIMIT 1", (category_id,))
+        if cur.fetchone():
+            return jsonify({"detail": "Cannot delete category that is in use by raw materials"}), 400
 
         cur.execute("DELETE FROM categories WHERE id = %s", (category_id,))
         conn.commit()
@@ -7452,7 +7483,7 @@ def raw_material_stock():
     conn = get_conn(); cur = get_cur(conn)
     try:
         cur.execute("""
-            SELECT i.id, i.name, i.unit, i.category, i.active, i.min_stock,
+            SELECT i.id, i.name, i.unit, i.category, i.category_id, i.subcategory_id, i.active, i.min_stock,
                    COALESCE(i.opening_qty, 0) AS opening_qty, i.opening_rate, i.opening_date,
                    COALESCE(p.qty, 0)    AS purchased,
                    COALESCE(p.amount, 0) AS purchase_value,
@@ -7496,6 +7527,7 @@ def raw_material_stock():
         for r in rows:
             d = _row_to_dict(r)
             d["id"]          = r["id"]
+            d["category_id"], d["subcategory_id"] = r["category_id"], r["subcategory_id"]
             d["stock_value"] = round(max(d["in_stock"], 0) * (d["avg_rate"] or 0), 2)
             d["low_stock"]   = d["in_stock"] <= 0 or (d["min_stock"] is not None and d["in_stock"] <= d["min_stock"])
             d["suppliers"]   = sup_map.get(r["id"], [])
