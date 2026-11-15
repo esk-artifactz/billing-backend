@@ -1095,6 +1095,12 @@ def ensure_db():
                       AND NOT EXISTS (SELECT 1 FROM products p WHERE p.category_id = c.id)
                 """)
 
+            # ── Public Menu card configuration: what shows on /menu + a note per category
+            # (e.g. Milkshakes → "Add ice cream +₹15")
+            cur.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS show_on_menu BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS menu_note TEXT")
+            cur.execute("ALTER TABLE products   ADD COLUMN IF NOT EXISTS show_on_menu BOOLEAN NOT NULL DEFAULT TRUE")
+
             # ── Date columns default to TODAY IN IST (server/DB run in UTC, so a plain
             # CURRENT_DATE default gave yesterday's date between 00:00 and 05:30 IST)
             for tbl, col in (
@@ -1784,6 +1790,8 @@ def create_category():
     description = (body.get("description") or "").strip()
     active      = body.get("active", True)
     ctype       = (body.get("category_type") or "product").strip().lower()
+    show_menu   = bool(body.get("show_on_menu", True))
+    menu_note   = (body.get("menu_note") or "").strip()[:500] or None
 
     if not name:
         return jsonify({"detail": "Category name is required"}), 400
@@ -1800,11 +1808,11 @@ def create_category():
 
         cur.execute(
             """
-            INSERT INTO categories (name, description, active, category_type)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO categories (name, description, active, category_type, show_on_menu, menu_note)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
-            (name, description or None, active, ctype),
+            (name, description or None, active, ctype, show_menu, menu_note),
         )
         category_row = cur.fetchone()
         conn.commit()
@@ -1849,6 +1857,10 @@ def update_category(category_id: int):
             if ctype not in CATEGORY_TYPES:
                 return jsonify({"detail": "category_type must be 'product' or 'raw_material'"}), 400
             fields.append("category_type = %s"); values.append(ctype)
+        if body.get("show_on_menu") is not None:
+            fields.append("show_on_menu = %s"); values.append(bool(body["show_on_menu"]))
+        if "menu_note" in body:   # empty string clears the note
+            fields.append("menu_note = %s"); values.append((body["menu_note"] or "").strip()[:500] or None)
 
         if fields:
             fields.append("updated_at = NOW()")
@@ -2100,17 +2112,20 @@ def public_menu():
     conn = get_conn()
     cur  = get_cur(conn)
     try:
+        # Only active PRODUCT categories switched on for the menu (raw material categories never show)
         cur.execute("""
-            SELECT id, name FROM categories
-            WHERE COALESCE(active, TRUE) = TRUE
+            SELECT id, name, menu_note FROM categories
+            WHERE COALESCE(active, TRUE) = TRUE AND category_type = 'product' AND show_on_menu = TRUE
             ORDER BY name
         """)
         categories = [_row_to_dict(r) for r in cur.fetchall()]
         cur.execute("""
-            SELECT id, name, selling_price, category_id, subcategory, unit
-            FROM products
-            WHERE COALESCE(active, TRUE) = TRUE
-            ORDER BY name
+            SELECT p.id, p.name, p.selling_price, p.category_id, p.subcategory, p.unit
+            FROM products p
+            JOIN categories c ON c.id = p.category_id
+            WHERE COALESCE(p.active, TRUE) = TRUE AND p.show_on_menu = TRUE
+              AND COALESCE(c.active, TRUE) = TRUE AND c.category_type = 'product' AND c.show_on_menu = TRUE
+            ORDER BY p.name
         """)
         products = [_row_to_dict(r) for r in cur.fetchall()]
         return jsonify({"categories": categories, "products": products})
@@ -2224,9 +2239,9 @@ def create_product():
             INSERT INTO products (name, barcode, brand, category_id, subcategory, unit,
                 purchase_price, mrp, selling_price, gst_percentage, track_stock,
                 current_stock, minimum_stock_level, quick_sale_enabled, active,
-                supplier_id, mfg_date, expiry_date, fssai_no)
+                supplier_id, mfg_date, expiry_date, fssai_no, show_on_menu)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                    COALESCE(%s::DATE,NULL), COALESCE(%s::DATE,NULL), %s)
+                    COALESCE(%s::DATE,NULL), COALESCE(%s::DATE,NULL), %s, %s)
             RETURNING *
             """,
             (name, barcode or None, brand or None, category_id, subcategory or None, unit,
@@ -2234,7 +2249,7 @@ def create_product():
              current_stock if track_stock else 0,
              minimum_stock_level if track_stock else 0,
              quick_sale_enabled, active,
-             supplier_id, mfg_date, expiry_date, fssai_no),
+             supplier_id, mfg_date, expiry_date, fssai_no, bool(body.get("show_on_menu", True))),
         )
         product_row = cur.fetchone()
         _ensure_subcategory(cur, product_row["category_id"], product_row["subcategory"])
@@ -2313,6 +2328,8 @@ def update_product(product_id: int):
             fields.append("quick_sale_enabled = %s"); values.append(quick_sale_enabled)
         if active is not None:
             fields.append("active = %s"); values.append(active)
+        if body.get("show_on_menu") is not None:
+            fields.append("show_on_menu = %s"); values.append(bool(body["show_on_menu"]))
 
         # New fields
         if "supplier_id" in body:
