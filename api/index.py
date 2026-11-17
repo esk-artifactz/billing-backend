@@ -1113,6 +1113,26 @@ def ensure_db():
             ):
                 cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT ((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)")
 
+            # ── Supplier raw-material bills as their own Daily Expense (credit part = Unpaid).
+            # Later payments against the bill are history rows, each mirrored in the supplier ledger.
+            cur.execute("""SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'daily_expenses' AND column_name = 'rm_bill_id'""")
+            first_rm_bill_expense = not cur.fetchone()
+            cur.execute("ALTER TABLE daily_expenses ADD COLUMN IF NOT EXISTS rm_bill_id BIGINT REFERENCES raw_material_bills(id) ON DELETE CASCADE")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_de_rm_bill ON daily_expenses(rm_bill_id) WHERE rm_bill_id IS NOT NULL")
+            cur.execute("ALTER TABLE supplier_ledger ADD COLUMN IF NOT EXISTS expense_payment_id BIGINT REFERENCES expense_payment_history(id) ON DELETE CASCADE")
+            if first_rm_bill_expense:
+                # One-time: give existing supplier bills their expense, and take their
+                # paid part out of the day's cumulative 'Raw Material Cost' entry
+                dcur = conn.cursor(cursor_factory=RealDictCursor)
+                dcur.execute("SELECT id FROM raw_material_bills WHERE supplier_id IS NOT NULL ORDER BY id")
+                for b in dcur.fetchall():
+                    _rm_bill_refresh(dcur, b["id"])
+                dcur.execute("SELECT DISTINCT bill_date, payment_mode FROM raw_material_bills WHERE supplier_id IS NOT NULL")
+                for r in dcur.fetchall():
+                    _rm_sync_expense(dcur, r["bill_date"], r["payment_mode"])
+                dcur.close()
+
         conn.commit()
         _db_ready = True
         # Explicitly release the advisory lock before closing so other
@@ -5377,12 +5397,15 @@ def _ledger_sync_expense(cur, exp_id):
     keep the ledger row in step with the expense (amount actually paid, date, mode)."""
     cur.execute(
         """SELECT id, supplier_id, category, expense_date, amount, paid_amount, payment_mode,
-                  description, recorded_by
+                  description, recorded_by, source, rm_bill_id
            FROM daily_expenses WHERE id = %s""",
         (exp_id,),
     )
     e = cur.fetchone()
     if not e:
+        return
+    if e["source"] == RM_BILL_SOURCE and e["rm_bill_id"]:
+        _rm_bill_ledger_sync(cur, e)   # raw-material bill: one ledger payment per history row
         return
     paid = float(e["paid_amount"] if e["paid_amount"] is not None else e["amount"])
     is_supplier_payment = (e["supplier_id"] and (e["category"] or "").strip().lower() == SUPPLIER_PAYMENT_CAT.lower())
@@ -5601,11 +5624,22 @@ def create_supplier_payment(sup_id: int):
     ensure_db()
     conn = get_conn(); cur = get_cur(conn)
     try:
-        entry_id = _supplier_payment(cur, sup_id, amount, (body.get("payment_date") or "").strip() or None, mode,
-                                     (body.get("note") or "").strip() or None, caller.get("username", "unknown"),
-                                     (body.get("reference") or "").strip() or None)
+        cur.execute("SELECT id FROM suppliers WHERE id = %s", (sup_id,))
+        if not cur.fetchone():
+            raise ValueError("Supplier not found")
+        pay_date = (body.get("payment_date") or "").strip() or None
+        note     = (body.get("note") or "").strip() or None
+        user     = caller.get("username", "unknown")
+        # First settle this supplier's unpaid raw-material bills (they are already in
+        # Daily Expenses as Unpaid) — only the rest becomes a new 'Supplier Payment' expense
+        left = _rm_allocate_supplier_payment(cur, sup_id, amount, pay_date, mode, note, user)
+        entry_id = None
+        if left > 0:
+            entry_id = _supplier_payment(cur, sup_id, left, pay_date, mode, note, user,
+                                         (body.get("reference") or "").strip() or None)
         conn.commit()
-        return jsonify({"message": "Payment recorded", "entry_id": entry_id}), 201
+        return jsonify({"message": "Payment recorded", "entry_id": entry_id,
+                        "applied_to_raw_material_bills": round(amount - left, 2)}), 201
     except ValueError as e:
         conn.rollback(); return jsonify({"detail": str(e)}), 404
     except Exception as e:
@@ -5634,6 +5668,14 @@ def delete_supplier_ledger_entry(entry_id: int):
             return jsonify({"detail": "Only bills and payments can be deleted here"}), 400
         if e.get("raw_material_bill_id"):
             return jsonify({"detail": "This is a raw material purchase — edit or delete it on the Raw Material Stock page"}), 400
+        if e.get("expense_payment_id"):
+            # Payment against a raw-material bill → remove that payment from the bill's history
+            cur.execute("DELETE FROM expense_payment_history WHERE id = %s RETURNING expense_id", (e["expense_payment_id"],))
+            h = cur.fetchone()
+            if h:
+                _recalc_paid_amount(cur, h["expense_id"])
+            conn.commit()
+            return jsonify({"message": "Payment deleted"})
         if e["expense_id"]:
             cur.execute("DELETE FROM daily_expenses WHERE id = %s", (e["expense_id"],))   # cascades to ledger
         cur.execute("DELETE FROM supplier_ledger WHERE id = %s", (entry_id,))
@@ -6375,6 +6417,11 @@ def update_daily_expense(exp_id: int):
             return jsonify({"detail": "This is an employee loan payout — manage it in HR & Salary → Loans"}), 400
 
         body = request.get_json(silent=True) or {}
+        pay_mode = body.get("payment_mode")   # mode for a payment added by a status change
+        if current["source"] == RM_BILL_SOURCE:
+            # Supplier raw-material bill: amount / date / items come from Raw Material Stock —
+            # only the payment status (and notes) can be changed here
+            body = {k: v for k, v in body.items() if k in ("paid_amount", "is_paid", "notes", "paid_on", "payment_note")}
         # Editing must not turn this entry into a duplicate of another one on the same day
         if any(k in body for k in ("expense_date", "category", "description")):
             new_date = body["expense_date"] if "expense_date" in body else current["expense_date"].isoformat()
@@ -6421,7 +6468,7 @@ def update_daily_expense(exp_id: int):
                 conn.rollback()
                 return jsonify({"detail": "Paid amount must be between 0 and the expense amount"}), 400
             _sync_payment_history(cur, exp_id, target,
-                                  payment_mode=(body.get("payment_mode") or er["payment_mode"] or "cash"),
+                                  payment_mode=(pay_mode or er["payment_mode"] or "cash"),
                                   paid_on=body.get("paid_on") or None,
                                   note=(body.get("payment_note") or "").strip() or None,
                                   recorded_by=(_p or {}).get("username"))
@@ -6636,6 +6683,8 @@ def delete_daily_expense(exp_id: int):
             return jsonify({"detail": "This total is maintained automatically — delete the purchases on the Raw Material Stock page"}), 400
         if row["source"] == "loan":
             return jsonify({"detail": "This is an employee loan payout — delete the loan in HR & Salary → Loans"}), 400
+        if row["source"] == RM_BILL_SOURCE:
+            return jsonify({"detail": "This is a raw material supplier bill — delete the purchase on the Raw Material Stock page"}), 400
         cur.execute("DELETE FROM daily_expenses WHERE id = %s", (exp_id,))
         conn.commit()
         return jsonify({"message": "Expense deleted"})
@@ -7404,8 +7453,10 @@ def _rm_sync_expense(cur, purchase_date, payment_mode, recorded_by=None):
         (purchase_date, payment_mode),
     )
     agg = cur.fetchone()
+    # Bills without a supplier are paid in full here; supplier bills have their own expense
     cur.execute(
-        "SELECT COALESCE(SUM(paid_now), 0) AS paid FROM raw_material_bills WHERE bill_date = %s AND payment_mode = %s",
+        """SELECT COALESCE(SUM(paid_now), 0) AS paid FROM raw_material_bills
+           WHERE bill_date = %s AND payment_mode = %s AND supplier_id IS NULL""",
         (purchase_date, payment_mode),
     )
     total = round(float(agg["unbilled"]) + float(cur.fetchone()["paid"]), 2)
@@ -7500,7 +7551,121 @@ def _rm_bill_refresh(cur, bill_id, recorded_by=None):
                ON CONFLICT DO NOTHING""",
             (bill["supplier_id"], bill_id),
         )
+        _rm_bill_expense(cur, bill, names, recorded_by)
+    else:
+        cur.execute("DELETE FROM daily_expenses WHERE rm_bill_id = %s", (bill_id,))
     return bill
+
+
+RM_BILL_SOURCE     = "raw_material_bill"
+RM_AT_PURCHASE_NOTE = "Paid at purchase"
+
+
+def _rm_bill_expense(cur, bill, names="", recorded_by=None):
+    """A supplier raw-material bill = its own 'Raw Material Cost' Daily Expense on the
+    bill date for the full bill total. Paid = paid at purchase + later payments
+    (payment history), so a credit purchase shows as Unpaid / Part paid."""
+    ref  = bill["invoice_no"] or f"RM-{bill['id']}"
+    desc = f"Raw material bill {ref}" + (f" — {names}" if names else "")
+    cur.execute("SELECT id FROM daily_expenses WHERE rm_bill_id = %s", (bill["id"],))
+    row = cur.fetchone()
+    if row:
+        exp_id = row["id"]
+        cur.execute(
+            """UPDATE daily_expenses SET expense_date = %s, amount = %s, payment_mode = %s, description = %s,
+                      paid_to = %s, supplier_id = %s, updated_at = NOW()
+               WHERE id = %s""",
+            (bill["bill_date"], bill["total"], bill["payment_mode"], desc, bill["vendor"], bill["supplier_id"], exp_id),
+        )
+    else:
+        cur.execute(
+            """INSERT INTO daily_expenses
+                 (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by,
+                  supplier_id, is_paid, paid_amount, source, rm_bill_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, 0, %s, %s) RETURNING id""",
+            (bill["bill_date"], RAW_MATERIAL_COST_CAT, desc, bill["total"], bill["payment_mode"], bill["vendor"],
+             "Auto-created from Raw Material Stock (supplier bill)", recorded_by or bill["recorded_by"],
+             bill["supplier_id"], RM_BILL_SOURCE, bill["id"]),
+        )
+        exp_id = cur.fetchone()["id"]
+    # 'Paid at purchase' history row = bill.paid_now
+    paid_now = round(float(bill["paid_now"] or 0), 2)
+    cur.execute("SELECT id FROM expense_payment_history WHERE expense_id = %s AND note = %s ORDER BY id LIMIT 1",
+                (exp_id, RM_AT_PURCHASE_NOTE))
+    ap = cur.fetchone()
+    if paid_now > 0 and ap:
+        cur.execute("UPDATE expense_payment_history SET amount = %s, paid_on = %s, payment_mode = %s WHERE id = %s",
+                    (paid_now, bill["bill_date"], bill["payment_mode"], ap["id"]))
+    elif paid_now > 0:
+        cur.execute(
+            """INSERT INTO expense_payment_history (expense_id, paid_on, amount, payment_mode, note, recorded_by)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (exp_id, bill["bill_date"], paid_now, bill["payment_mode"], RM_AT_PURCHASE_NOTE,
+             recorded_by or bill["recorded_by"]),
+        )
+    elif ap:
+        cur.execute("DELETE FROM expense_payment_history WHERE id = %s", (ap["id"],))
+    # Bill made smaller than what is already paid → trim the latest payments
+    cur.execute("SELECT COALESCE(SUM(amount), 0) AS s FROM expense_payment_history WHERE expense_id = %s", (exp_id,))
+    if float(cur.fetchone()["s"]) > float(bill["total"]) + 0.001:
+        _sync_payment_history(cur, exp_id, float(bill["total"]))
+    _recalc_paid_amount(cur, exp_id)   # → _ledger_sync_expense mirrors later payments in the ledger
+    return exp_id
+
+
+def _rm_bill_ledger_sync(cur, exp):
+    """Supplier ledger for a raw-material bill expense: one 'payment' row per later
+    payment (history rows other than 'Paid at purchase'); the paid-at-purchase part
+    stays the bill's own payment row (raw_material_bill_id) and follows the history."""
+    cur.execute("SELECT * FROM raw_material_bills WHERE id = %s", (exp["rm_bill_id"],))
+    b = cur.fetchone()
+    if not b or not b["supplier_id"]:
+        return
+    ref = b["invoice_no"] or f"RM-{b['id']}"
+    cur.execute("""DELETE FROM supplier_ledger WHERE expense_payment_id IN
+                   (SELECT id FROM expense_payment_history WHERE expense_id = %s)""", (exp["id"],))
+    cur.execute("SELECT * FROM expense_payment_history WHERE expense_id = %s ORDER BY paid_on, id", (exp["id"],))
+    at_purchase = 0.0
+    for h in cur.fetchall():
+        if h["note"] == RM_AT_PURCHASE_NOTE:
+            at_purchase += float(h["amount"])
+            continue
+        eid = _ledger_add(cur, b["supplier_id"], "payment", h["amount"], h["paid_on"], ref,
+                          payment_mode=h["payment_mode"], notes=h["note"] or "Payment for raw material bill",
+                          recorded_by=h["recorded_by"])
+        cur.execute("UPDATE supplier_ledger SET expense_payment_id = %s WHERE id = %s", (h["id"], eid))
+    at_purchase = round(at_purchase, 2)
+    if at_purchase != round(float(b["paid_now"] or 0), 2):
+        # 'Paid at purchase' changed from Daily Expenses (e.g. marked Unpaid) — keep bill + ledger in step
+        cur.execute("UPDATE raw_material_bills SET paid_now = %s WHERE id = %s", (at_purchase, b["id"]))
+        cur.execute("DELETE FROM supplier_ledger WHERE raw_material_bill_id = %s AND entry_type = 'payment'", (b["id"],))
+        if at_purchase > 0:
+            eid = _ledger_add(cur, b["supplier_id"], "payment", at_purchase, b["bill_date"], ref,
+                              payment_mode=b["payment_mode"], notes="Paid at purchase", recorded_by=b["recorded_by"])
+            cur.execute("UPDATE supplier_ledger SET raw_material_bill_id = %s WHERE id = %s", (b["id"], eid))
+
+
+def _rm_allocate_supplier_payment(cur, supplier_id, amount, paid_on, payment_mode, note, recorded_by):
+    """Use a supplier payment to settle that supplier's unpaid raw-material bill
+    expenses (oldest first). Returns the amount left over (not used)."""
+    left = round(float(amount), 2)
+    cur.execute("""SELECT id, amount, COALESCE(paid_amount, 0) AS paid FROM daily_expenses
+                   WHERE source = %s AND supplier_id = %s AND COALESCE(paid_amount, 0) < amount
+                   ORDER BY expense_date, id""", (RM_BILL_SOURCE, supplier_id))
+    for e in cur.fetchall():
+        if left <= 0:
+            break
+        pay = round(min(left, float(e["amount"]) - float(e["paid"])), 2)
+        if pay <= 0:
+            continue
+        cur.execute(
+            """INSERT INTO expense_payment_history (expense_id, paid_on, amount, payment_mode, note, recorded_by)
+               VALUES (%s, COALESCE(%s::DATE, %s), %s, %s, %s, %s)""",
+            (e["id"], paid_on, _ist_today(), pay, payment_mode, note or "Supplier payment", recorded_by),
+        )
+        _recalc_paid_amount(cur, e["id"])
+        left = round(left - pay, 2)
+    return left
 
 
 # PUT /api/raw-material-items/<id>/suppliers — set which suppliers supply this material
