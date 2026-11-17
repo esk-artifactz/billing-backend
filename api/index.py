@@ -6399,22 +6399,37 @@ def update_daily_expense(exp_id: int):
             fields.append("employee_id = %s"); vals.append(body["employee_id"] or None)
         if "supplier_id" in body:
             fields.append("supplier_id = %s"); vals.append(body["supplier_id"] or None)
-        # paid_amount / is_paid — support both; paid_amount takes precedence
+        # paid_amount / is_paid — support both; paid_amount takes precedence.
+        # The paid total is applied through the payment history (below), so every
+        # status change (Paid / Part paid / Unpaid) shows up in the expense's History.
+        new_paid = None
         if "paid_amount" in body:
-            pa = float(body["paid_amount"])
-            fields.append("paid_amount = %s"); vals.append(pa)
-            fields.append("is_paid = (COALESCE(%s, paid_amount) >= amount)"); vals.append(pa)
+            new_paid = float(body["paid_amount"] or 0)
         elif "is_paid" in body:
-            flag = bool(body["is_paid"])
-            fields.append("is_paid = %s"); vals.append(flag)
-            fields.append("paid_amount = CASE WHEN %s THEN amount ELSE 0 END"); vals.append(flag)
-        if not fields:
+            new_paid = "full" if bool(body["is_paid"]) else 0.0
+        if not fields and new_paid is None:
             return jsonify({"detail": "No fields to update"}), 400
-        fields.append("updated_at = NOW()")
-        vals.append(exp_id)
-        cur.execute(f"UPDATE daily_expenses SET {', '.join(fields)} WHERE id = %s RETURNING *", vals)
-        expense = _expense_to_dict(cur.fetchone())
-        _ledger_sync_expense(cur, exp_id)
+        if fields:
+            fields.append("updated_at = NOW()")
+            vals.append(exp_id)
+            cur.execute(f"UPDATE daily_expenses SET {', '.join(fields)} WHERE id = %s RETURNING *", vals)
+        if new_paid is not None:
+            cur.execute("SELECT amount, payment_mode FROM daily_expenses WHERE id = %s", (exp_id,))
+            er = cur.fetchone()
+            target = float(er["amount"]) if new_paid == "full" else new_paid
+            if target < 0 or round(target, 2) > round(float(er["amount"]), 2):
+                conn.rollback()
+                return jsonify({"detail": "Paid amount must be between 0 and the expense amount"}), 400
+            _sync_payment_history(cur, exp_id, target,
+                                  payment_mode=(body.get("payment_mode") or er["payment_mode"] or "cash"),
+                                  paid_on=body.get("paid_on") or None,
+                                  note=(body.get("payment_note") or "").strip() or None,
+                                  recorded_by=(_p or {}).get("username"))
+            expense = _recalc_paid_amount(cur, exp_id)   # also syncs the supplier ledger
+        else:
+            cur.execute("SELECT * FROM daily_expenses WHERE id = %s", (exp_id,))
+            expense = _expense_to_dict(cur.fetchone())
+            _ledger_sync_expense(cur, exp_id)
         conn.commit()
         return jsonify({"message": "Expense updated", "expense": expense})
     except Exception as e:
@@ -6424,6 +6439,36 @@ def update_daily_expense(exp_id: int):
 
 
 # ── Expense Payment History ────────────────────────────────────────────────────
+
+def _sync_payment_history(cur, exp_id, target, payment_mode="cash", paid_on=None, note=None, recorded_by=None):
+    """Make the instalment history add up to `target` (the new paid total):
+    paid more → add one history row for the difference (dated today IST unless given);
+    paid less → remove / reduce the most recent rows (e.g. 'Unpaid' clears them)."""
+    target = round(float(target), 2)
+    cur.execute("SELECT COALESCE(SUM(amount), 0) AS s FROM expense_payment_history WHERE expense_id = %s", (exp_id,))
+    diff = round(target - float(cur.fetchone()["s"]), 2)
+    if diff > 0:
+        cur.execute(
+            """INSERT INTO expense_payment_history (expense_id, paid_on, amount, payment_mode, note, recorded_by)
+               VALUES (%s, COALESCE(%s::DATE, %s), %s, %s, %s, %s)""",
+            (exp_id, paid_on, _ist_today(), diff, payment_mode, note or "Payment status updated", recorded_by),
+        )
+    elif diff < 0:
+        excess = -diff
+        cur.execute("""SELECT id, amount FROM expense_payment_history WHERE expense_id = %s
+                       ORDER BY paid_on DESC, created_at DESC, id DESC""", (exp_id,))
+        for r in cur.fetchall():
+            if excess <= 0:
+                break
+            amt = float(r["amount"])
+            if amt <= excess + 0.001:
+                cur.execute("DELETE FROM expense_payment_history WHERE id = %s", (r["id"],))
+                excess = round(excess - amt, 2)
+            else:
+                cur.execute("UPDATE expense_payment_history SET amount = %s WHERE id = %s",
+                            (round(amt - excess, 2), r["id"]))
+                excess = 0
+
 
 def _recalc_paid_amount(cur, exp_id):
     """Re-sum all instalment rows and write back to daily_expenses.paid_amount + is_paid."""
