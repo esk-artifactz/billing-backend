@@ -1113,6 +1113,18 @@ def ensure_db():
             ):
                 cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT ((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)")
 
+            # ── Billing notes (reminders typed at the billing counter → Unpaid Daily Expense
+            # in a holding category, completed at day end) + Daily labour employees
+            # (attendance → Unpaid 'Labour' expense for that day's pay)
+            cur.execute(
+                """INSERT INTO expense_categories (name, description, color, sort_order)
+                   VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING""",
+                (BILLING_NOTE_CAT, "Notes typed during billing — set the real category / amount at day end", "#e11d48", 0),
+            )
+            cur.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_daily_labour BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_de_daily_labour ON daily_expenses(employee_id, expense_date)
+                           WHERE source = 'daily_labour'""")
+
             # ── Supplier raw-material bills as their own Daily Expense (credit part = Unpaid).
             # Later payments against the bill are history rows, each mirrored in the supplier ledger.
             cur.execute("""SELECT 1 FROM information_schema.columns
@@ -3891,6 +3903,7 @@ def create_employee():
     join_date              = (body.get("join_date") or "").strip() or None
     default_designation_id = body.get("default_designation_id") or None
     desig_effective_from   = (body.get("designation_effective_from") or "").strip() or None
+    is_daily_labour        = bool(body.get("is_daily_labour", False))
     bonus_type             = (body.get("bonus_type") or "").strip()[:30] or None
     try:
         bonus_amount       = max(0.0, float(body.get("bonus_amount") or 0))
@@ -3921,12 +3934,12 @@ def create_employee():
             """
             INSERT INTO employees
                 (emp_code, full_name, phone, role, daily_rate, join_date, default_designation_id,
-                 bonus_type, bonus_amount)
-            VALUES (%s, %s, %s, %s, %s, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s, %s)
+                 bonus_type, bonus_amount, is_daily_labour)
+            VALUES (%s, %s, %s, %s, %s, COALESCE(%s::DATE, (NOW() AT TIME ZONE 'Asia/Kolkata')::DATE), %s, %s, %s, %s)
             RETURNING id
             """,
             (emp_code, full_name, phone or None, role, daily_rate, join_date, default_designation_id,
-             bonus_type, bonus_amount),
+             bonus_type, bonus_amount, is_daily_labour),
         )
         new_id = cur.fetchone()["id"]
         # Record designation assignment in history (defaults to join_date or today)
@@ -4004,6 +4017,8 @@ def update_employee(emp_id: int):
             fields.append("join_date = %s"); values.append(join_date)
         if active is not None:
             fields.append("active = %s"); values.append(active)
+        if "is_daily_labour" in body:
+            fields.append("is_daily_labour = %s"); values.append(bool(body["is_daily_labour"]))
         if "bonus_type" in body:
             fields.append("bonus_type = %s"); values.append((body["bonus_type"] or "").strip()[:30] or None)
         if "bonus_amount" in body:
@@ -4090,6 +4105,70 @@ def update_employee(emp_id: int):
 # Status: present | absent | half_day | leave
 # ---------------------------------------------------------------------------
 
+DAILY_LABOUR_SOURCE = "daily_labour"
+# How much of an employee-linked Daily Expense counts as wages paid in HR:
+# manual entries = their amount (as before); daily-labour entries = only what was actually paid
+_EMP_EXP_PAID = "CASE WHEN source = 'daily_labour' THEN COALESCE(paid_amount, 0) ELSE amount END"
+
+
+def _daily_labour_sync(cur, employee_id, att_date, recorded_by=None):
+    """Daily-labour employee: keep one Unpaid 'Labour' Daily Expense per attendance day
+    for that day's pay (Present = day rate, Half day = ½, + OT) — a reminder to pay
+    them at day end. Absent / leave (or not daily labour) removes an unpaid entry."""
+    cur.execute(
+        """SELECT e.full_name, e.is_daily_labour, a.status, COALESCE(a.ot_hours, 0) AS ot_hours,
+                  COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) AS day_rate,
+                  COALESCE(NULLIF(a.ot_rate, 0), NULLIF(att_d.ot_rate, 0), NULLIF(def_d.ot_rate, 0),
+                           COALESCE(att_d.daily_rate, def_d.daily_rate, e.daily_rate, 0) / 8.0) AS ot_hourly_rate
+           FROM employees e
+           LEFT JOIN attendance a ON a.employee_id = e.id AND a.att_date = %s::DATE
+           LEFT JOIN designations def_d ON def_d.id = COALESCE(
+               (SELECT h.designation_id FROM employee_designation_history h
+                 WHERE h.employee_id = e.id AND h.effective_from <= %s::DATE
+                 ORDER BY h.effective_from DESC LIMIT 1),
+               e.default_designation_id)
+           LEFT JOIN designations att_d ON att_d.id = a.designation_id
+           WHERE e.id = %s""",
+        (att_date, att_date, employee_id),
+    )
+    r = cur.fetchone()
+    cur.execute("""SELECT id, COALESCE(paid_amount, 0) AS paid FROM daily_expenses
+                   WHERE source = %s AND employee_id = %s AND expense_date = %s::DATE""",
+                (DAILY_LABOUR_SOURCE, employee_id, att_date))
+    existing = cur.fetchone()
+    pay, parts = 0.0, []
+    if r and r["is_daily_labour"] and r["status"] in ("present", "half_day"):
+        rate = float(r["day_rate"] or 0)
+        pay = rate if r["status"] == "present" else rate * 0.5
+        parts.append("Present" if r["status"] == "present" else "Half day")
+        ot = float(r["ot_hours"] or 0)
+        if ot > 0:
+            pay += ot * float(r["ot_hourly_rate"] or 0)
+            parts.append(f"OT {ot:g}h")
+    pay = round(pay, 2)
+    if pay <= 0:
+        # Nothing to pay that day — drop the reminder unless money was already paid on it
+        if existing and float(existing["paid"]) <= 0:
+            cur.execute("DELETE FROM daily_expenses WHERE id = %s", (existing["id"],))
+        return
+    desc = f"Daily labour — {r['full_name']} ({', '.join(parts)})"
+    if existing:
+        cur.execute("UPDATE daily_expenses SET amount = %s, description = %s, updated_at = NOW() WHERE id = %s",
+                    (pay, desc, existing["id"]))
+        if float(existing["paid"]) > pay:
+            _sync_payment_history(cur, existing["id"], pay)
+        _recalc_paid_amount(cur, existing["id"])
+    else:
+        cur.execute(
+            """INSERT INTO daily_expenses
+                 (expense_date, category, description, amount, payment_mode, paid_to, notes, recorded_by,
+                  employee_id, is_paid, paid_amount, source)
+               VALUES (%s::DATE, 'Labour', %s, %s, 'cash', %s, %s, %s, %s, FALSE, 0, %s)""",
+            (att_date, desc, pay, r["full_name"], "Auto-added from attendance (daily labour)", recorded_by,
+             employee_id, DAILY_LABOUR_SOURCE),
+        )
+
+
 @app.post("/attendance")
 @app.post("/api/attendance")
 def mark_attendance():
@@ -4159,6 +4238,7 @@ def mark_attendance():
              designation_id, ot_hours, ot_rate),
         )
         att = _emp_to_dict(cur.fetchone())
+        _daily_labour_sync(cur, employee_id, att_date, marked_by)   # daily labour → Unpaid Labour expense
         conn.commit()
         return jsonify({"message": "Attendance marked", "attendance": att}), 201
     except Exception as e:
@@ -4282,8 +4362,9 @@ def _salary_carry_forward(cur, month, employee_id=None):
     ef = emp_filter.replace("a.employee_id", "employee_id")
     add(f"SELECT employee_id, SUM(amount) AS amt FROM employee_bonuses WHERE bonus_month < %s {ef} GROUP BY employee_id", +1)
     add(f"SELECT employee_id, SUM(amount_paid) AS amt FROM salary_payments WHERE pay_month < %s {ef} GROUP BY employee_id", -1)
-    add(f"""SELECT employee_id, SUM(amount) AS amt FROM daily_expenses
-            WHERE employee_id IS NOT NULL AND COALESCE(source, 'manual') = 'manual'
+    # Wages paid via Daily Expenses (manual rows: amount; daily-labour rows: what was actually paid)
+    add(f"""SELECT employee_id, SUM({_EMP_EXP_PAID}) AS amt FROM daily_expenses
+            WHERE employee_id IS NOT NULL AND COALESCE(source, 'manual') IN ('manual', 'daily_labour')
               AND expense_date < %s::DATE {ef} GROUP BY employee_id""", -1)
     add(f"""SELECT employee_id, SUM(amount) AS amt FROM advances
             WHERE recovered = FALSE AND given_on < %s::DATE {ef} GROUP BY employee_id""", -1)
@@ -4489,12 +4570,12 @@ def attendance_report():
         # as /salary/pay, so a Cashier-recorded salary expense reduces balance due
         exp_paid_map = {}
         cur.execute(
-            """
+            f"""
             SELECT employee_id,
-                   COALESCE(SUM(amount), 0) AS exp_paid
+                   COALESCE(SUM({_EMP_EXP_PAID}), 0) AS exp_paid
             FROM daily_expenses
             WHERE employee_id IS NOT NULL
-              AND COALESCE(source, 'manual') = 'manual'
+              AND COALESCE(source, 'manual') IN ('manual', 'daily_labour')
               AND TO_CHAR(expense_date, 'YYYY-MM') = %s
             GROUP BY employee_id
             """,
@@ -4647,11 +4728,12 @@ def attendance_detail():
             payments.append(d)
 
         # Salary paid via Daily Expenses for this employee this month
-        cur.execute("""
-            SELECT id, expense_date, amount, description, payment_mode
+        cur.execute(f"""
+            SELECT id, expense_date, {_EMP_EXP_PAID} AS amount, description, payment_mode
             FROM daily_expenses
             WHERE employee_id = %s
-              AND COALESCE(source, 'manual') = 'manual'
+              AND COALESCE(source, 'manual') IN ('manual', 'daily_labour')
+              AND {_EMP_EXP_PAID} > 0
               AND TO_CHAR(expense_date, 'YYYY-MM') = %s
             ORDER BY expense_date
         """, (employee_id, month))
@@ -4982,10 +5064,39 @@ def mark_salary_paid():
         payment_mode = "cash"
 
     try:
-        cur.execute("SELECT id, full_name FROM employees WHERE id = %s", (employee_id,))
+        cur.execute("SELECT id, full_name, is_daily_labour FROM employees WHERE id = %s", (employee_id,))
         emp = cur.fetchone()
         if not emp:
             return jsonify({"detail": "Employee not found"}), 404
+
+        # Daily labour: their days are already in Daily Expenses as Unpaid 'Labour' entries —
+        # settle those first (oldest first) so the payment is not counted twice
+        settled = 0.0
+        if emp["is_daily_labour"] and payment_type == "salary":
+            left = round(amount_paid, 2)
+            cur.execute("""SELECT id, amount, COALESCE(paid_amount, 0) AS paid FROM daily_expenses
+                           WHERE source = %s AND employee_id = %s AND COALESCE(paid_amount, 0) < amount
+                           ORDER BY expense_date, id""", (DAILY_LABOUR_SOURCE, employee_id))
+            for e in cur.fetchall():
+                if left <= 0:
+                    break
+                pay = round(min(left, float(e["amount"]) - float(e["paid"])), 2)
+                if pay <= 0:
+                    continue
+                cur.execute(
+                    """INSERT INTO expense_payment_history (expense_id, paid_on, amount, payment_mode, note, recorded_by)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (e["id"], _ist_today(), pay, payment_mode, notes or "Paid from HR & Salary", paid_by),
+                )
+                _recalc_paid_amount(cur, e["id"])
+                left = round(left - pay, 2)
+            settled = round(amount_paid - left, 2)
+            amount_paid = left
+            if amount_paid <= 0:
+                conn.commit()
+                return jsonify({"message": f"Payment of ₹{settled:.2f} applied to daily labour entries",
+                                "settled_daily_labour": settled}), 201
+
         cur.execute(
             """
             INSERT INTO salary_payments (employee_id, pay_month, amount_paid, payment_type, paid_by, notes)
@@ -5011,7 +5122,7 @@ def mark_salary_paid():
              notes, paid_by, employee_id, amount_paid),
         )
         conn.commit()
-        return jsonify({"message": "Payment recorded", "salary_payment": sp}), 201
+        return jsonify({"message": "Payment recorded", "salary_payment": sp, "settled_daily_labour": settled}), 201
     except Exception as e:
         conn.rollback()
         return jsonify({"detail": str(e)}), 400
@@ -5049,11 +5160,12 @@ def list_salary_payments():
         # Salary/wage payments logged via Daily Expenses for this employee+month —
         # merged in so the salary history matches the balance shown in the report
         cur.execute(
-            """
-            SELECT id, expense_date, category, description, amount, recorded_by, created_at
+            f"""
+            SELECT id, expense_date, category, description, {_EMP_EXP_PAID} AS amount, recorded_by, created_at
             FROM daily_expenses
             WHERE employee_id = %s AND TO_CHAR(expense_date, 'YYYY-MM') = %s
-              AND COALESCE(source, 'manual') = 'manual'
+              AND COALESCE(source, 'manual') IN ('manual', 'daily_labour')
+              AND {_EMP_EXP_PAID} > 0
             ORDER BY expense_date, created_at
             """,
             (employee_id, pay_month),
@@ -6396,6 +6508,51 @@ def create_daily_expense():
         cur.close(); conn.close()
 
 
+BILLING_NOTE_CAT    = "Billing Note (to review)"
+BILLING_NOTE_SOURCE = "billing_note"
+
+
+# POST /api/daily-expenses/note — quick reminder typed at the billing counter.
+# Body: { text, amount? }. Saved as an Unpaid Daily Expense in the holding category
+# 'Billing Note (to review)'; at day end it is edited into the real expense.
+@app.post("/daily-expenses/note")
+@app.post("/api/daily-expenses/note")
+def create_billing_note():
+    caller, err_resp = require_auth()
+    if err_resp:
+        return err_resp
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()[:300]
+    if not text:
+        return jsonify({"detail": "Type what the note is for"}), 400
+    try:
+        amount = round(float(body.get("amount") or 0), 2)
+    except (TypeError, ValueError):
+        return jsonify({"detail": "Amount must be a number"}), 400
+    if amount < 0:
+        return jsonify({"detail": "Amount cannot be negative"}), 400
+    user = caller.get("username", "unknown")
+    stamp = datetime.now(timezone.utc).astimezone(IST).strftime("%I:%M %p")
+    ensure_db()
+    conn = get_conn(); cur = get_cur(conn)
+    try:
+        cur.execute(
+            """INSERT INTO daily_expenses
+                 (expense_date, category, description, amount, payment_mode, notes, recorded_by,
+                  is_paid, paid_amount, source)
+               VALUES (%s, %s, %s, %s, 'cash', %s, %s, FALSE, 0, %s) RETURNING *""",
+            (_ist_today(), BILLING_NOTE_CAT, text, amount, f"Noted at billing by {user} at {stamp}", user,
+             BILLING_NOTE_SOURCE),
+        )
+        note = _expense_to_dict(cur.fetchone())
+        conn.commit()
+        return jsonify({"message": "Note saved", "expense": note}), 201
+    except Exception as e:
+        conn.rollback(); return jsonify({"detail": str(e)}), 400
+    finally:
+        cur.close(); conn.close()
+
+
 # PUT /api/daily-expenses/<id>
 @app.put("/daily-expenses/<int:exp_id>")
 @app.put("/api/daily-expenses/<int:exp_id>")
@@ -6422,6 +6579,15 @@ def update_daily_expense(exp_id: int):
             # Supplier raw-material bill: amount / date / items come from Raw Material Stock —
             # only the payment status (and notes) can be changed here
             body = {k: v for k, v in body.items() if k in ("paid_amount", "is_paid", "notes", "paid_on", "payment_note")}
+        elif current["source"] == DAILY_LABOUR_SOURCE:
+            # Daily-labour pay comes from attendance (change it there) — only payment status / mode / notes here
+            body = {k: v for k, v in body.items()
+                    if k in ("paid_amount", "is_paid", "notes", "payment_mode", "paid_on", "payment_note")}
+        elif current["source"] == BILLING_NOTE_SOURCE:
+            new_cat = (body.get("category") or "").strip()
+            if new_cat and new_cat != BILLING_NOTE_CAT:
+                # Billing note completed with a real category → becomes a normal expense
+                cur.execute("UPDATE daily_expenses SET source = 'manual' WHERE id = %s", (exp_id,))
         # Editing must not turn this entry into a duplicate of another one on the same day
         if any(k in body for k in ("expense_date", "category", "description")):
             new_date = body["expense_date"] if "expense_date" in body else current["expense_date"].isoformat()
