@@ -1113,6 +1113,15 @@ def ensure_db():
             ):
                 cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT ((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE)")
 
+            # ── Raw material purchases are recorded in the Raw Material module only (no Daily
+            # Expense / supplier-ledger entries — expenses are added manually later).
+            # Bills that existed before this keep their entries (link_expense = TRUE).
+            cur.execute("""SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'raw_material_bills' AND column_name = 'link_expense'""")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE raw_material_bills ADD COLUMN link_expense BOOLEAN NOT NULL DEFAULT TRUE")
+                cur.execute("ALTER TABLE raw_material_bills ALTER COLUMN link_expense SET DEFAULT FALSE")
+
             # ── Billing notes (reminders typed at the billing counter → Unpaid Daily Expense
             # in a holding category, completed at day end) + Daily labour employees
             # (attendance → Unpaid 'Labour' expense for that day's pay)
@@ -7619,10 +7628,11 @@ def _rm_sync_expense(cur, purchase_date, payment_mode, recorded_by=None):
         (purchase_date, payment_mode),
     )
     agg = cur.fetchone()
-    # Bills without a supplier are paid in full here; supplier bills have their own expense
+    # Bills without a supplier are paid in full here; supplier bills have their own expense.
+    # Only older bills (link_expense) count — new purchases are not added to Daily Expenses.
     cur.execute(
         """SELECT COALESCE(SUM(paid_now), 0) AS paid FROM raw_material_bills
-           WHERE bill_date = %s AND payment_mode = %s AND supplier_id IS NULL""",
+           WHERE bill_date = %s AND payment_mode = %s AND supplier_id IS NULL AND link_expense""",
         (purchase_date, payment_mode),
     )
     total = round(float(agg["unbilled"]) + float(cur.fetchone()["paid"]), 2)
@@ -7694,6 +7704,16 @@ def _rm_bill_refresh(cur, bill_id, recorded_by=None):
         (total, total, total, bill_id),
     )
     bill = cur.fetchone()
+    if not bill["link_expense"]:
+        # Recorded in the Raw Material module only — no Daily Expense / supplier-ledger entries
+        if bill["supplier_id"]:
+            cur.execute(
+                """INSERT INTO raw_material_suppliers (item_id, supplier_id)
+                   SELECT DISTINCT item_id, %s FROM raw_material_purchases WHERE bill_id = %s
+                   ON CONFLICT DO NOTHING""",
+                (bill["supplier_id"], bill_id),
+            )
+        return bill
     cur.execute("DELETE FROM supplier_ledger WHERE raw_material_bill_id = %s", (bill_id,))
     if bill["supplier_id"]:
         ref = bill["invoice_no"] or f"RM-{bill_id}"
